@@ -1,0 +1,4912 @@
+"""
+在庫管理オペレーション基盤 PoCアプリ（CSV版）
+- 7つのCSVを取り込んで、店舗別の計画/実績の在庫推移を計算・表示
+- コントローラーがチューニング用に使う参照ツール
+"""
+import streamlit as st
+import pandas as pd
+import numpy as np
+import datetime
+import pickle
+import os
+import sys
+import subprocess
+from pathlib import Path
+
+# ========== ページ設定 ==========
+st.set_page_config(
+    page_title="在庫オペレーション基盤",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+st.markdown("""
+<style>
+    /* ===== タスクG（2026/6/3）タブレット視認性：ベースフォント拡大 =====
+       現場ヒアリング「とにかく文字を大きく」への対応。root(html)の font-size を
+       16px→20px(+25%) に上げる。アプリ内CSSは大半が rem 基準のため、本文・見出し・
+       キャプション・タブ・dataframe・st.metric・selectbox・色付き在庫表まで比例して
+       一段大きくなる。タッチ領域(min-height: 44/48/32px)は px 指定なので不変＝
+       ボタン重なりは起きない。試行錯誤型：現場フィードバックで次回さらに調整する。 */
+    html { font-size: 20px !important; }
+
+    .main .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+
+    /* DataFrameの文字を大きく（高齢者・タブレット閲覧向け） */
+    .stDataFrame { font-size: 1.05rem; }
+    .stDataFrame [data-testid="stDataFrameResizable"] {
+        font-size: 1.05rem;
+    }
+    /* dataframe内のセル */
+    .stDataFrame [role="gridcell"] {
+        font-size: 1.05rem !important;
+        padding: 8px 10px !important;
+    }
+    /* dataframeのヘッダー */
+    .stDataFrame [role="columnheader"] {
+        font-size: 1rem !important;
+        font-weight: 700 !important;
+        padding: 10px !important;
+    }
+    
+    /* st.data_editorも同様に */
+    [data-testid="stDataFrame"] [role="gridcell"] {
+        font-size: 1.05rem !important;
+    }
+    
+    div[data-testid="stMetric"] { background: #f0f2f6; padding: 0.5rem; border-radius: 0.5rem; }
+    
+    /* タブレット向け：サイドバーのボタンを大きく */
+    section[data-testid="stSidebar"] button {
+        min-height: 44px;
+        font-size: 0.95rem;
+    }
+    
+    /* タブレット向け：タブを大きく */
+    button[data-baseweb="tab"] {
+        min-height: 48px;
+        font-size: 1.05rem;
+    }
+
+    /* タブレット向け：店舗切替ボタンをコンパクト化（2026/5/19） */
+    /* 全 stButton をコンパクトに（影響範囲：店舗ボタン群が主、他は数も少ないので許容） */
+    .stButton > button {
+        padding: 0.25rem 0.6rem !important;
+        font-size: 0.85rem !important;
+        min-height: 32px !important;
+        line-height: 1.2 !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+# ========== 定数 ==========
+HOUZAI_KUBUN = {'包材(本体)', '包材（蓋）', '包材(内装)', 'シール'}
+
+# データ保存先（アプリと同じフォルダの data サブディレクトリ）
+DATA_DIR = Path(__file__).parent / 'data'
+DATA_DIR.mkdir(exist_ok=True)
+SAVE_PATH = DATA_DIR / 'session_data.pkl'
+ADJUSTMENTS_PATH = DATA_DIR / 'adjustments.pkl'
+WEBHOOK_CONFIG_PATH = DATA_DIR / 'webhook_config.json'
+MATERIAL_GROUPS_PATH = DATA_DIR / 'material_groups.csv'
+# 棚卸カウント確認画面：棚卸対象の店舗別 例外設定（2026-05-30 追加）
+# 列: 店舗名, 原料JAN, 種別（'追加' / '除外'）。ベース層は inventory から動的取得のため不要。
+TANAOROSHI_TARGET_OVERRIDE_PATH = DATA_DIR / 'tanaoroshi_target_store_override.csv'
+# 仕込み指示画面：仕込み（解凍）対象の設定（2026-05-30 追加）
+# ベース層（全店共通）＋店舗別上書きの2層。仕込み対象は 'TRUE'/'FALSE' 文字列。
+SHIKOMI_TARGET_BASE_PATH = DATA_DIR / 'shikomi_target_base.csv'
+SHIKOMI_TARGET_STORE_OVERRIDE_PATH = DATA_DIR / 'shikomi_target_store_override.csv'
+
+
+def load_webhook_url():
+    """Google Chat の Webhook URL を読み込む（未設定なら None）"""
+    import json
+    if WEBHOOK_CONFIG_PATH.exists():
+        try:
+            with open(WEBHOOK_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)
+                return cfg.get('url')
+        except Exception:
+            return None
+    return None
+
+
+def save_webhook_url(url):
+    """Google Chat の Webhook URL を保存"""
+    import json
+    try:
+        with open(WEBHOOK_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump({'url': url}, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"Webhook設定保存エラー: {e}")
+        return False
+
+
+def send_to_google_chat(message, webhook_url):
+    """Google Chat にテキストメッセージを送信。
+    成功すれば True、失敗すれば エラーメッセージ文字列。
+    """
+    import requests
+    try:
+        response = requests.post(
+            webhook_url,
+            json={'text': message},
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return True
+        else:
+            return f"送信失敗（HTTP {response.status_code}）：{response.text[:200]}"
+    except requests.exceptions.Timeout:
+        return "送信失敗：タイムアウト（10秒）"
+    except requests.exceptions.ConnectionError:
+        return "送信失敗：接続エラー（ネットワークを確認してください）"
+    except Exception as e:
+        return f"送信失敗：{e}"
+
+
+def get_managed_jans_path(store=None):
+    """管理対象原料の設定ファイルパス。
+    store指定があれば店舗別ファイル、なければ共通ファイル。
+    """
+    import json
+    if store:
+        # ファイル名に使えない文字を除去
+        safe = "".join(c for c in store if c.isalnum() or c in ('-', '_'))
+        return DATA_DIR / f'managed_jans_{safe}.json'
+    return DATA_DIR / 'managed_jans_common.json'
+
+
+def load_managed_jans(store=None):
+    """管理対象JANの設定を読み込む。
+    優先順位：店舗別 > 共通 > なし（全表示）。
+    
+    Returns:
+        dict: {'jans': [...], 'description': '...'} または None（設定なし）
+    """
+    import json
+    if store:
+        store_path = get_managed_jans_path(store)
+        if store_path.exists():
+            try:
+                with open(store_path, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except Exception:
+                pass
+    common_path = get_managed_jans_path(None)
+    if common_path.exists():
+        try:
+            with open(common_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+
+def save_managed_jans(jans, store=None, description=''):
+    """管理対象JANを設定ファイルに保存"""
+    import json
+    path = get_managed_jans_path(store)
+    data = {
+        'jans': list(jans),
+        'description': description,
+        'store': store or '共通',
+    }
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        st.error(f"設定保存エラー: {e}")
+        return False
+
+
+def delete_managed_jans(store=None):
+    """管理対象JANの設定ファイルを削除（=フィルタ解除）"""
+    path = get_managed_jans_path(store)
+    if path.exists():
+        try:
+            path.unlink()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+# ========== 店舗グルーピング設定（2026/5/18 追加） ==========
+# CLAUDE.md §5.1.5「店舗スコープと将来拡張への備え」の具体化。
+# 店舗をエリア・地域・カテゴリなどで業務単位にまとめ、エリア在庫タブ等で
+# 横断ビューを実現するための設定を data/store_groups.json に保存する。
+#
+# データ構造：
+#   {
+#     "groups": [
+#       {"name": "福岡市内エリア", "stores": ["宇美店", "筑紫野店", ...]},
+#       ...
+#     ],
+#     "_updated_at": "ISO8601 timestamp"
+#   }
+def get_store_groups_path():
+    return DATA_DIR / 'store_groups.json'
+
+
+def load_store_groups():
+    """店舗グルーピング設定を読込。ファイルなければ空構造を返す。"""
+    import json
+    path = get_store_groups_path()
+    if not path.exists():
+        return {'groups': []}
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {'groups': []}
+
+
+def save_store_groups(data):
+    """店舗グルーピング設定を保存。"""
+    import json
+    path = get_store_groups_path()
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_store_to_group_map(groups_data=None):
+    """{店舗名: グループ名} の dict を返す（未割り当て店舗は含まれない）。"""
+    if groups_data is None:
+        groups_data = load_store_groups()
+    m = {}
+    for g in groups_data.get('groups', []):
+        gn = g.get('name', '')
+        for s in g.get('stores', []):
+            m[s] = gn
+    return m
+
+
+# ===========================================================
+# 原料の関連グループ（material_groups.csv）
+# ===========================================================
+# CD違い同一原料の手動グループ定義を読み込むためのレイヤー。
+# - 在庫データ本体には触らない（純粋な参照テーブル）
+# - CSV 未配置でも空 DataFrame を返して動作継続（後方互換）
+# - 列欠損などのフォーマット異常時はログのみ出力し例外を投げない
+@st.cache_data(show_spinner=False)
+def load_material_groups():
+    """material_groups.csv を読み込んで DataFrame を返す。
+
+    返り値の列：material_cd, group_id, group_name, note,
+              registered_date, registered_by
+    ファイル未存在・必須列欠損・読込例外のいずれも空 DataFrame を返す。
+    """
+    cols = ['material_cd', 'group_id', 'group_name', 'note',
+            'registered_date', 'registered_by']
+    if not MATERIAL_GROUPS_PATH.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(MATERIAL_GROUPS_PATH, dtype=str, encoding='utf-8-sig')
+        df.columns = df.columns.str.strip()
+        required = ['material_cd', 'group_id']
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            print(f"[WARN] material_groups.csv: 必須列が欠損 {missing}、空として扱います")
+            return pd.DataFrame(columns=cols)
+        for c in df.columns:
+            if df[c].dtype == 'object':
+                df[c] = df[c].fillna('').astype(str).str.strip()
+        df = df[(df['material_cd'] != '') & (df['group_id'] != '')]
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ''
+        return df[cols].reset_index(drop=True)
+    except Exception as e:
+        print(f"[WARN] material_groups.csv 読込失敗: {e}")
+        return pd.DataFrame(columns=cols)
+
+
+def get_related_material_cds(material_cd, groups_df=None):
+    """指定の material_cd と同じグループに属する material_cd を全て返す（自分含む）。
+
+    - グループ未登録の material_cd → 空リスト
+    - グループ登録あり → 自分を含む全メンバー（重複なし、登録順）
+    """
+    if not material_cd:
+        return []
+    if groups_df is None:
+        groups_df = load_material_groups()
+    if len(groups_df) == 0:
+        return []
+    key = str(material_cd).strip()
+    own_rows = groups_df[groups_df['material_cd'] == key]
+    if len(own_rows) == 0:
+        return []
+    gid = own_rows['group_id'].iloc[0]
+    members = groups_df[groups_df['group_id'] == gid]['material_cd'].tolist()
+    seen = set()
+    out = []
+    for m in members:
+        if m and m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def filter_by_managed_jans(df, managed_jans):
+    """DataFrameを管理対象JANで絞り込む。
+    managed_jans が None または空なら、絞り込まない（全表示）。
+    """
+    if not managed_jans or not managed_jans.get('jans'):
+        return df
+    if len(df) == 0:
+        return df
+    if '原料JAN' not in df.columns:
+        return df
+    return df[df['原料JAN'].isin(managed_jans['jans'])].copy()
+
+
+# ===========================================================
+# 棚卸カウント確認画面 ヘルパー（2026-05-30 追加）
+# ===========================================================
+# 「見込み在庫数」の予習画面用。棚卸対象は inventory（その店舗の登録原料）を
+# ベースとし、店舗別の例外設定（追加/除外）で調整する。計算ロジックは新規作成せず
+# calculate_flow の結果を再利用する（compute_expected_inventory を参照）。
+def load_tanaoroshi_override():
+    """棚卸対象の店舗別 例外設定 CSV を読込。
+    列: 店舗名, 原料JAN, 種別（'追加' / '除外'）。未存在なら空 DataFrame。
+    """
+    cols = ['店舗名', '原料JAN', '種別']
+    if not TANAOROSHI_TARGET_OVERRIDE_PATH.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(TANAOROSHI_TARGET_OVERRIDE_PATH, dtype=str, encoding='utf-8-sig')
+        df.columns = df.columns.str.strip()
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ''
+        for c in cols:
+            df[c] = df[c].fillna('').astype(str).str.strip()
+        df = df[(df['店舗名'] != '') & (df['原料JAN'] != '')]
+        return df[cols].reset_index(drop=True)
+    except Exception as e:
+        print(f"[WARN] tanaoroshi_target_store_override.csv 読込失敗: {e}")
+        return pd.DataFrame(columns=cols)
+
+
+def save_tanaoroshi_override(df):
+    """棚卸対象の店舗別 例外設定 CSV を保存。"""
+    cols = ['店舗名', '原料JAN', '種別']
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = ''
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    out[cols].to_csv(TANAOROSHI_TARGET_OVERRIDE_PATH, index=False, encoding='utf-8-sig')
+
+
+def get_tanaoroshi_inventory_jans(store_name, loaded, opening_date=None):
+    """その店舗の直近棚卸に登録されている原料JANセット（ベース層）を返す。"""
+    inv = loaded.get('inventory')
+    if inv is None or len(inv) == 0:
+        return set()
+    inv_s = inv[inv['店舗名'] == store_name]
+    if len(inv_s) == 0:
+        return set()
+    if opening_date is None:
+        if inv_s['棚卸日_d'].dropna().empty:
+            return set()
+        opening_date = inv_s['棚卸日_d'].dropna().max()
+    inv_open = inv_s[inv_s['棚卸日_d'] == opening_date]
+    jan_col = 'JAN' if 'JAN' in inv_open.columns else '原料JAN'
+    return set(inv_open[jan_col].dropna().astype(str).unique())
+
+
+def get_tanaoroshi_targets_for_store(store_name, loaded, opening_date=None, override_df=None):
+    """棚卸カウント対象の最終 原料JAN セットを返す。
+    = inventory のベース集合 ＋ 例外『追加』 − 例外『除外』。
+    """
+    base = get_tanaoroshi_inventory_jans(store_name, loaded, opening_date)
+    if override_df is None:
+        override_df = load_tanaoroshi_override()
+    if len(override_df) > 0:
+        ov = override_df[override_df['店舗名'] == store_name]
+        add = set(ov[ov['種別'] == '追加']['原料JAN'].astype(str))
+        rem = set(ov[ov['種別'] == '除外']['原料JAN'].astype(str))
+        base = (base | add) - rem
+    return base
+
+
+def compute_expected_inventory(material_jan, flow_df, opening_dict,
+                               period_start, period_end):
+    """1原料の見込み在庫数を計算する。
+
+    見込み在庫数 = 前回棚卸数 + 期間入数 − 期間出数
+
+    計算ロジックは新規作成せず、calculate_flow が出力した日別の入/出（flow_df）を
+    期間 (period_start, period_end] で集計するだけ。flow_df は opening_date を起点に
+    残を積み上げているため、period_start == opening_date のとき period_end の「残」と
+    一致する（＝既存の実績在庫推移の再利用）。
+
+    Args:
+        material_jan (str): 対象原料JAN。
+        flow_df (pd.DataFrame): calculate_flow の出力（列 '原料JAN','日付','入','出','残'）。
+        opening_dict (dict): {原料JAN: 前回棚卸数}。
+        period_start (datetime.date): 期間起点（現状は全原料共通＝前回棚卸日）。
+        period_end (datetime.date): 期間終点（＝棚卸予定日）。
+
+    Returns:
+        dict: {'前回棚卸数','期間入数','期間出数','見込み在庫数'}。
+
+    Note:
+        将来の部分棚卸対応では原料ごとに period_start が変わる。その場合は
+        period_start 時点の実カウント値を base に据える拡張が必要（§6-1）。
+    """
+    prev = float(opening_dict.get(material_jan, 0.0))
+    if flow_df is None or len(flow_df) == 0 or '原料JAN' not in flow_df.columns:
+        return {'前回棚卸数': prev, '期間入数': 0.0, '期間出数': 0.0, '見込み在庫数': prev}
+    sub = flow_df[flow_df['原料JAN'] == material_jan]
+    sub = sub[(sub['日付'] > period_start) & (sub['日付'] <= period_end)]
+    in_sum = float(sub['入'].sum())
+    out_sum = float(sub['出'].sum())
+    return {
+        '前回棚卸数': prev,
+        '期間入数': in_sum,
+        '期間出数': out_sum,
+        '見込み在庫数': prev + in_sum - out_sum,
+    }
+
+
+# ===========================================================
+# 仕込み指示画面 ヘルパー（2026-05-30 追加）
+# ===========================================================
+# 翌日以降に解凍すべき寿司ネタの量（パック）を計算する。
+# 在庫・納品予定は考慮しない（解凍は「使う前に冷凍から戻す」工程のため）。
+# 仕込み対象は全店共通ベース＋店舗別上書きの2層で管理する。
+def load_shikomi_target_base():
+    """shikomi_target_base.csv を読込。ベース層（全店共通）の仕込み対象設定。
+    列: 原料JAN, 原料名, 原料区分, 仕込み対象（'TRUE'/'FALSE' 文字列）
+    """
+    cols = ['原料JAN', '原料名', '原料区分', '仕込み対象']
+    if not SHIKOMI_TARGET_BASE_PATH.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(SHIKOMI_TARGET_BASE_PATH, dtype=str, encoding='utf-8-sig')
+        df.columns = df.columns.str.strip()
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ''
+        for c in df.columns:
+            if df[c].dtype == 'object':
+                df[c] = df[c].fillna('').astype(str).str.strip()
+        return df[cols].reset_index(drop=True)
+    except Exception as e:
+        print(f"[WARN] shikomi_target_base.csv 読込失敗: {e}")
+        return pd.DataFrame(columns=cols)
+
+
+def save_shikomi_target_base(df):
+    """ベース層を保存。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(SHIKOMI_TARGET_BASE_PATH, index=False, encoding='utf-8-sig')
+
+
+def load_shikomi_target_store_override():
+    """店舗別上書き設定を読込。
+    列: 店舗名, 原料JAN, 仕込み対象（'TRUE'/'FALSE'）
+    """
+    cols = ['店舗名', '原料JAN', '仕込み対象']
+    if not SHIKOMI_TARGET_STORE_OVERRIDE_PATH.exists():
+        return pd.DataFrame(columns=cols)
+    try:
+        df = pd.read_csv(SHIKOMI_TARGET_STORE_OVERRIDE_PATH, dtype=str, encoding='utf-8-sig')
+        df.columns = df.columns.str.strip()
+        for c in cols:
+            if c not in df.columns:
+                df[c] = ''
+        for c in df.columns:
+            if df[c].dtype == 'object':
+                df[c] = df[c].fillna('').astype(str).str.strip()
+        return df[cols].reset_index(drop=True)
+    except Exception as e:
+        print(f"[WARN] shikomi_target_store_override.csv 読込失敗: {e}")
+        return pd.DataFrame(columns=cols)
+
+
+def save_shikomi_target_store_override(df):
+    """店舗別上書きを保存。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    df.to_csv(SHIKOMI_TARGET_STORE_OVERRIDE_PATH, index=False, encoding='utf-8-sig')
+
+
+def get_shikomi_targets_for_store(store_name):
+    """指定店舗の最終的な仕込み対象 原料JAN セットを返す。
+    ベース層（対象=TRUE）に店舗別上書きをマージする。
+    """
+    base_df = load_shikomi_target_base()
+    override_df = load_shikomi_target_store_override()
+
+    base_target = set()
+    if len(base_df) > 0:
+        m = base_df['仕込み対象'].str.upper() == 'TRUE'
+        base_target = set(base_df[m]['原料JAN'].dropna())
+
+    if len(override_df) > 0:
+        store_overrides = override_df[override_df['店舗名'] == store_name]
+        for _, row in store_overrides.iterrows():
+            jan = row['原料JAN']
+            flag = str(row['仕込み対象']).upper() == 'TRUE'
+            if flag:
+                base_target.add(jan)
+            else:
+                base_target.discard(jan)
+
+    return base_target
+
+
+def compute_shikomi_for_store(store_name, loaded, target_dates):
+    """指定店舗・指定日付群について、原料ごとの仕込み数量（パック）を計算。
+
+    返り値: DataFrame（列 ['原料JAN','原料名','原料区分','入数', 日付1, 日付2, ...]）。
+    各日付セルは「切り上げパック数」。全日0の原料は除外。
+
+    計算ロジック:
+      ある日の原料Xの必要量 = Σ(その日の各商品の計画数 × レシピでのX使用量)
+      仕込み量(パック) = ceil(必要量 / 原料の入数)
+    在庫・納品予定は考慮しない（解凍工程の性質上）。
+    """
+    import math
+
+    plan = loaded.get('plan')
+    recipe = loaded.get('recipe')
+    material = loaded.get('material')
+
+    if plan is None or recipe is None or material is None:
+        return pd.DataFrame()
+    if len(plan) == 0 or len(recipe) == 0:
+        return pd.DataFrame()
+
+    plan_s = plan[plan['店舗名'] == store_name].copy() if '店舗名' in plan.columns else plan.copy()
+    if len(plan_s) == 0:
+        return pd.DataFrame()
+
+    target_jans = get_shikomi_targets_for_store(store_name)
+    if not target_jans:
+        return pd.DataFrame()
+
+    # レシピを「商品JAN → [(原料JAN, 使用量), ...]」で持つ
+    recipe_by_product = {}
+    for _, r in recipe.iterrows():
+        prod_jan = r['JAN']
+        mat_jan = r['原料JAN']
+        try:
+            usage = float(r['使用量'])
+        except (ValueError, TypeError):
+            continue
+        recipe_by_product.setdefault(prod_jan, []).append((mat_jan, usage))
+
+    mat_idx = material.set_index('原料JAN')
+
+    # need[mat_jan][date] = 必要量
+    need = {jan: {d: 0.0 for d in target_dates} for jan in target_jans}
+    for _, p in plan_s.iterrows():
+        d = p.get('日付_d')
+        if d not in target_dates:
+            continue
+        prod_jan = p.get('JAN')
+        try:
+            plan_qty = float(p['計画数'])
+        except (ValueError, TypeError):
+            continue
+        if prod_jan not in recipe_by_product:
+            continue
+        for mat_jan, usage in recipe_by_product[prod_jan]:
+            if mat_jan in target_jans:
+                need[mat_jan][d] += plan_qty * usage
+
+    rows = []
+    for mat_jan, day_dict in need.items():
+        if mat_jan not in mat_idx.index:
+            continue
+        mat_info = mat_idx.loc[mat_jan]
+        if isinstance(mat_info, pd.DataFrame):  # 原料JAN重複時の保護
+            mat_info = mat_info.iloc[0]
+        try:
+            pack_size = float(mat_info.get('入数', 1) or 1)
+            if pack_size <= 0:
+                pack_size = 1
+        except (ValueError, TypeError):
+            pack_size = 1
+
+        row = {
+            '原料JAN': mat_jan,
+            '原料名': mat_info.get('原料名', ''),
+            '原料区分': mat_info.get('原料区分', ''),
+            '入数': int(pack_size) if pack_size == int(pack_size) else pack_size,
+        }
+        any_nonzero = False
+        for d in target_dates:
+            qty = day_dict.get(d, 0.0)
+            packs = (qty / pack_size) if qty > 0 else 0  # [タスクH-2] ceil削除
+            row[d] = packs
+            if packs > 0:
+                any_nonzero = True
+        if any_nonzero:
+            rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(['原料区分', '原料名']).reset_index(drop=True)
+
+
+def save_data_to_disk(loaded, last_update, stores):
+    """取り込み済みデータをディスクに保存"""
+    try:
+        with open(SAVE_PATH, 'wb') as f:
+            pickle.dump({
+                'loaded': loaded,
+                'last_update': last_update,
+                'stores': stores,
+            }, f)
+        return True
+    except Exception as e:
+        st.error(f"データ保存エラー: {e}")
+        return False
+
+
+def load_data_from_disk():
+    """ディスクから取り込み済みデータを読み込み"""
+    if not SAVE_PATH.exists():
+        return None
+    try:
+        with open(SAVE_PATH, 'rb') as f:
+            return pickle.load(f)
+    except Exception as e:
+        st.warning(f"保存データの読込に失敗: {e}")
+        return None
+
+
+# ========== 取込パイプライン（正規ルートを管理画面から実行） ==========
+# 設計（2026-06-06）：取り込みは convert_raw_to_app.py → update_data.py の正規ルートに一本化する。
+# 旧「📥データ再取込」(process_uploaded_files=変換済み7ファイル全置換) はバッチの正規ルートと二重化し
+# 実行バラつきの温床だった（CLAUDE.md §J）。ここでは核ロジック(update_data/convert_raw)は一切変更せず、
+# subprocess で実証済みスクリプトを呼ぶだけ＝リスク最小で UI に集約する。
+SCRIPT_DIR = Path(__file__).parent
+RAW_EXPORT_DIR = SCRIPT_DIR / 'business_system_export'
+INPUT_RAW_DIR = SCRIPT_DIR / 'input_raw'
+
+
+def _list_csv_brief(folder, limit=40):
+    """フォルダ直下のファイル名を簡易一覧（取込前の状況把握用）"""
+    try:
+        files = sorted([p.name for p in folder.glob('*') if p.is_file()])
+    except Exception:
+        return []
+    return files[:limit]
+
+
+def run_pipeline_script(script_name, timeout=600):
+    """正規ルートのスクリプトを subprocess で実行し、結果を返す。
+    update_data.py / convert_raw_to_app.py 末尾の input() は EOF/空行で抜ける（実証済み '' | python 方式）。
+    戻り値: (ok: bool, log: str)
+    """
+    script_path = SCRIPT_DIR / script_name
+    if not script_path.exists():
+        return False, f"スクリプトが見つかりません: {script_path}"
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script_path)],
+            input='\n',                 # 末尾 input() を空入力で抜ける
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            cwd=str(SCRIPT_DIR),        # 各スクリプトは cwd 相対で input_raw 等を読む
+            timeout=timeout,
+        )
+        log = (proc.stdout or '') + (('\n[stderr]\n' + proc.stderr) if proc.stderr else '')
+        return (proc.returncode == 0), log
+    except subprocess.TimeoutExpired:
+        return False, f"タイムアウト（{timeout}秒）：処理が長すぎます。"
+    except Exception as e:
+        return False, f"実行エラー: {e}"
+
+
+# フルロード基本7ファイル（update_data.py の FULL_FILES と必ず一致させること）
+_FULL_LOAD_FILES = [
+    '原料データ.csv', 'レシピデータ.csv', '計画数データ.csv', '製造数データ.csv',
+    '納品予定数.csv', '実納品数データ.csv', '棚卸データ.csv',
+]
+
+
+def auto_quarantine_fullload_for_diff():
+    """差分日（input_raw に日付付きファイルがある日）に、過去フルロードの「日付なし基本7ファイル」が
+    input_raw に残置していると、update_data.py が『フルロードと差分の混在』で停止する（取込が反映されない）。
+    その混在条件＝update_data.py の detect_mode と同一（基本7ファイルが全部 かつ 日付付きファイルが1つ以上）
+    のときだけ、日付なし基本7ファイルを input_raw\\_quarantine_fullload_YYYYMMDD_HHMMSS\\ へ自動退避する。
+
+    - 取込は前フルロードで反映済みなので退避してもデータは失われない（可逆：戻せば再処理可）。
+    - 月初フルロード（日付付きが無い日）や棚卸C方針（日付なし棚卸単独配置＝7ファイル揃わない）には作用しない。
+    - update_data.py / convert_raw_to_app.py には一切手を入れない（CLAUDE.md §N の鉄則）。
+    戻り値: (moved: list[str], quarantine_dir_name: str|None)
+    """
+    try:
+        files = list(INPUT_RAW_DIR.glob('*.csv'))
+    except Exception:
+        return [], None
+    names = {p.name for p in files}
+    has_full = all(n in names for n in _FULL_LOAD_FILES)
+    # 日付付き判定：先頭8桁が数字（YYYYMMDD<種別>.csv）＝update_data の差分判定と整合
+    has_diff = any(p.name[:8].isdigit() and len(p.name) > 12 for p in files)
+    if not (has_full and has_diff):
+        return [], None
+    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    qdir = INPUT_RAW_DIR / f'_quarantine_fullload_{stamp}'
+    try:
+        qdir.mkdir(parents=True, exist_ok=True)
+        moved = []
+        for n in _FULL_LOAD_FILES:
+            src = INPUT_RAW_DIR / n
+            if src.exists():
+                src.rename(qdir / n)
+                moved.append(n)
+        return moved, qdir.name
+    except Exception:
+        return [], None
+
+
+def reload_pkl_into_session():
+    """update_data.py が更新した session_data.pkl を読み直して session_state に反映。
+    戻り値: (ok: bool, msg: str)
+    """
+    saved = load_data_from_disk()
+    if not saved:
+        return False, "pkl の読込に失敗しました（session_data.pkl が見つからない／壊れている）。"
+    st.session_state.loaded = saved['loaded']
+    st.session_state.last_update = saved.get('last_update')
+    st.session_state.stores = saved['stores']
+    st.session_state.data_loaded = True
+    # 計算キャッシュ無効化（古いデータでの計算結果を使わせない）
+    st.session_state.data_version = st.session_state.get('data_version', 0) + 1
+    return True, f"{len(saved['stores'])}店舗を再読込しました。"
+
+
+def save_adjustments_to_disk(adjustments):
+    """ズレ補正データをディスクに保存
+    adjustments: dict
+      key: (店舗名, 原料JAN)
+      value: {'補正値': float, '種別': 'A過渡期'/'B恒久的', 'メモ': str, '更新日': str}
+    """
+    try:
+        with open(ADJUSTMENTS_PATH, 'wb') as f:
+            pickle.dump(adjustments, f)
+        return True
+    except Exception as e:
+        st.error(f"補正データ保存エラー: {e}")
+        return False
+
+
+def load_adjustments_from_disk():
+    """ディスクからズレ補正データを読み込み"""
+    if not ADJUSTMENTS_PATH.exists():
+        return {}
+    try:
+        with open(ADJUSTMENTS_PATH, 'rb') as f:
+            return pickle.load(f)
+    except Exception:
+        return {}
+
+
+# ========== ユーティリティ ==========
+def parse_jp_date(s, year=2026):
+    """「4月17日」「2026/4/17」などをdateに変換"""
+    if pd.isna(s):
+        return None
+    s = str(s).strip()
+    try:
+        if '月' in s and '日' in s:
+            m = s.replace('日', '').split('月')
+            return datetime.date(year, int(m[0]), int(m[1]))
+        if '/' in s:
+            parts = s.split('/')
+            return datetime.date(int(parts[0]), int(parts[1]), int(parts[2]))
+        if '-' in s:
+            return datetime.date.fromisoformat(s)
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
+def load_csv_from_upload(uploaded_file):
+    """アップロードされたCSVをDataFrameに変換"""
+    df = pd.read_csv(uploaded_file, encoding='utf-8-sig')
+    df.columns = [c.strip() for c in df.columns]
+    for c in df.columns:
+        if df[c].dtype == 'object':
+            df[c] = df[c].astype(str).str.strip()
+    for c in df.columns:
+        if 'JAN' in c:
+            df[c] = df[c].astype(str).str.strip()
+    return df
+
+
+def detect_file_kind(df):
+    """DataFrameの列名から、どのファイルかを推測"""
+    cols = set(df.columns)
+    if {'原料JAN', '入数', '原料区分'}.issubset(cols):
+        return 'material'
+    if {'原料JAN', '原料名', '使用量'}.issubset(cols) and 'JAN' in cols:
+        return 'recipe'
+    if '棚卸日' in cols and '棚卸数' in cols:
+        return 'inventory'
+    if '製造数' in cols:
+        return 'actual_prod'
+    if '計画数' in cols:
+        return 'plan'
+    if '仕入計上数' in cols:
+        return 'actual_del'
+    if '納品予定数' in cols:
+        return 'plan_del'
+    return None
+
+
+# ========== 計算ロジック ==========
+def calculate_flow(
+    store_name,
+    inv_s, plan_s, aprod_s, pdel_s, adel_s,
+    recipe_df, material_df,
+    target_date, base_days, yield_fusoku, yield_kasoku,
+    adjustments=None,  # ズレ補正：{原料JAN: 補正値} の辞書
+):
+    """指定店舗・指定パラメータで在庫推移を計算
+    
+    adjustments: 該当店舗の {原料JAN: 補正値} 辞書。期首在庫に加算される。
+    """
+    inv_s = inv_s[inv_s['店舗名'] == store_name].copy() if len(inv_s) > 0 else inv_s
+    plan_s = plan_s[plan_s['店舗名'] == store_name].copy() if len(plan_s) > 0 else plan_s
+    aprod_s = aprod_s[aprod_s['店舗名'] == store_name].copy() if len(aprod_s) > 0 else aprod_s
+    pdel_s = pdel_s[pdel_s['店舗名'] == store_name].copy() if len(pdel_s) > 0 else pdel_s
+    adel_s = adel_s[adel_s['店舗名'] == store_name].copy() if len(adel_s) > 0 else adel_s
+    
+    if len(inv_s) == 0 or inv_s['棚卸日_d'].dropna().empty:
+        return pd.DataFrame()
+    opening_date = inv_s['棚卸日_d'].dropna().max()
+    
+    plan_dates = plan_s['日付_d'].dropna()
+    if plan_dates.empty:
+        return pd.DataFrame()
+    end_date = plan_dates.max()
+    
+    date_range = []
+    cur = opening_date + datetime.timedelta(days=1)
+    while cur <= end_date:
+        date_range.append(cur)
+        cur += datetime.timedelta(days=1)
+    
+    material_idx = material_df.set_index('原料JAN')
+    
+    recipe_by_material = {}
+    for _, r in recipe_df.iterrows():
+        m_jan = r['原料JAN']
+        recipe_by_material.setdefault(m_jan, []).append((r['JAN'], float(r['使用量'])))
+    
+    inv_opening = inv_s[inv_s['棚卸日_d'] == opening_date].copy()
+    opening_dict = inv_opening.groupby('JAN')['棚卸数'].sum().to_dict()
+    
+    # ズレ補正を期首在庫に加算
+    if adjustments:
+        for jan, adj_val in adjustments.items():
+            if adj_val:  # 0以外の補正値のみ反映
+                current = opening_dict.get(jan, 0.0)
+                opening_dict[jan] = current + float(adj_val)
+    
+    target_jans = set(opening_dict.keys())
+    target_jans |= set(recipe_by_material.keys())
+    if len(pdel_s) > 0:
+        target_jans |= set(pdel_s['JAN'].dropna().unique())
+    if len(adel_s) > 0:
+        target_jans |= set(adel_s['JAN'].dropna().unique())
+    target_jans &= set(material_idx.index)
+    
+    plan_dict = {}
+    for _, p in plan_s.iterrows():
+        plan_dict[(p['JAN'], p['日付_d'])] = plan_dict.get((p['JAN'], p['日付_d']), 0) + float(p['計画数'])
+    
+    aprod_dict = {}
+    for _, p in aprod_s.iterrows():
+        aprod_dict[(p['JAN'], p['日付_d'])] = aprod_dict.get((p['JAN'], p['日付_d']), 0) + float(p['製造数'])
+    
+    pdel_dict = {}
+    for _, d in pdel_s.iterrows():
+        pdel_dict[(d['JAN'], d['納品予定日_d'])] = pdel_dict.get((d['JAN'], d['納品予定日_d']), 0) + float(d['納品予定数'])
+    
+    adel_dict = {}
+    for _, d in adel_s.iterrows():
+        adel_dict[(d['JAN'], d['納品予定日_d'])] = adel_dict.get((d['JAN'], d['納品予定日_d']), 0) + float(d['仕入計上数'])
+    
+    rows = []
+    for m_jan in target_jans:
+        m_info = material_idx.loc[m_jan]
+        if isinstance(m_info, pd.DataFrame):
+            m_info = m_info.iloc[0]
+        
+        m_name = m_info['原料名']
+        try:
+            nyusu = float(m_info['入数'])
+        except (ValueError, TypeError):
+            nyusu = 1
+        if nyusu == 0:
+            nyusu = 1
+        
+        kubun = m_info.get('原料区分', '')
+        target_kbn = m_info.get('対象区分', '')
+        is_houzai = kubun in HOUZAI_KUBUN
+        
+        uses = recipe_by_material.get(m_jan, [])
+        
+        remain = float(opening_dict.get(m_jan, 0.0))
+        usage_history = []
+        
+        for d in date_range:
+            if target_date is not None and d <= target_date:
+                in_qty = adel_dict.get((m_jan, d), 0.0)
+                source_dict = aprod_dict
+            else:
+                in_qty = pdel_dict.get((m_jan, d), 0.0)
+                source_dict = plan_dict
+            
+            out_qty = 0.0
+            for prod_jan, usage_per_item in uses:
+                qty = source_dict.get((prod_jan, d), 0.0)
+                if qty > 0:
+                    used_raw = qty * usage_per_item
+                    if is_houzai:
+                        out_qty += used_raw
+                    else:
+                        out_qty += used_raw / nyusu
+            
+            remain = remain + in_qty - out_qty
+            usage_history.append(out_qty)
+            
+            recent = usage_history[-base_days:] if len(usage_history) >= base_days else usage_history
+            if sum(recent) > 0:
+                avg_use = sum(recent) / len(recent)
+                yf = yield_fusoku if target_kbn == '不測' else yield_kasoku
+                safety = avg_use / yf * base_days
+            else:
+                safety = 0.0
+            
+            diff = remain - safety
+            
+            rows.append({
+                '原料JAN': m_jan,
+                '原料名': m_name,
+                '原料区分': kubun,
+                '対象区分': target_kbn,
+                '入数': nyusu,
+                '日付': d,
+                '入': round(in_qty, 3),
+                '出': round(out_qty, 3),
+                '残': round(remain, 3),
+                '安全在庫': round(safety, 3),
+                '差': round(diff, 3),
+            })
+    
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# 原料区分の業務的並び順（2026/5/14 確認、2026/5/18 共通化）
+# ==========================================================
+# 並び順の規則：
+#   1. 原料Noあり区分：min(原料No) の昇順（ご飯→サーモン→マグロ…）
+#   2. 原料Noなし区分（野菜・包材(内装)など）：区分名のアルファベット昇順
+#   3. 包材(本体)：末尾から2番目
+#   4. 包材（蓋）：最末尾
+# 用途：棚卸評価タブ、エリア在庫タブ、原料ピックアップタブ等で共通使用。
+def get_sorted_material_categories(material_df, exclude_target_gai=True):
+    """原料区分を業務的並び順で返す。
+
+    Args:
+        material_df (pd.DataFrame): 原料マスタ。列に '原料区分' と（必要に応じて）
+            '原料No'、'対象区分' を含む。
+        exclude_target_gai (bool): True なら '対象区分=対象外' を除外した結果を返す。
+
+    Returns:
+        list[str]: 業務的並び順で並べた原料区分名のリスト。
+    """
+    mat = material_df.copy()
+    if exclude_target_gai and '対象区分' in mat.columns:
+        mat = mat[mat['対象区分'] != '対象外']
+    if '原料No' in mat.columns:
+        mat['原料No_int'] = pd.to_numeric(mat['原料No'], errors='coerce')
+    else:
+        mat['原料No_int'] = pd.NA
+
+    kubun_min_no = mat.groupby('原料区分')['原料No_int'].min(numeric_only=True).to_dict()
+    max_no = mat['原料No_int'].max(skipna=True)
+    if pd.isna(max_no):
+        max_no = 0
+    BODY_KEY = '包材(本体)'
+    LID_KEY = '包材（蓋）'
+
+    # NaN系区分（包材本体・蓋以外）を区分名アルファベット順で並べる
+    nan_kubuns = sorted([k for k, v in kubun_min_no.items()
+                         if pd.isna(v) and k not in (BODY_KEY, LID_KEY)])
+    nan_kubun_order = {k: max_no + 100 + i for i, k in enumerate(nan_kubuns)}
+
+    def category_order(k):
+        if k == BODY_KEY:
+            return max_no + 9999
+        if k == LID_KEY:
+            return max_no + 10000
+        if k in nan_kubun_order:
+            return nan_kubun_order[k]
+        v = kubun_min_no.get(k)
+        if pd.isna(v):
+            return max_no + 99
+        return v
+
+    return sorted(kubun_min_no.keys(), key=category_order)
+
+
+# ==========================================================
+# 棚卸評価ロジック（2026/5/14 追加）
+# ==========================================================
+# 業務的目的：棚卸結果と論理在庫の乖離を評価し、原料ごとに ◎○△× を付ける。
+#   論理在庫 = max(0, 前回棚卸 + 期間内納品 - 期間内使用量)
+#   差        = 実在庫 - 論理在庫
+#   |差|の絶対値で：◎≤5 / ○≤20 / △≤30 / ×>30
+#
+# また、各原料を「不動 / 過剰α / 過剰 / 不足」の分類でラベリングする：
+#   不動    : 期間中の納品=0 かつ 使用量=0
+#   過剰α  : 実在庫 ≥ 安全在庫×2
+#   過剰    : 実在庫 ≥ 安全在庫
+#   不足    : 実在庫 < 安全在庫
+#   安全在庫 = base_days × 1日使用量
+#   1日使用量 = 評価日から先1週間の計画ベースの使用予定量平均（⓪余裕日数と同じ）
+def calculate_inventory_evaluation(store_name, target_date, loaded, base_days=3,
+                                    yield_fusoku=0.7, yield_kasoku=0.9):
+    """棚卸評価の計算。原料ごとに 論理/実/差/評価/分類 を出す。
+
+    Args:
+        store_name (str): 店舗名（例：'宇美店'）
+        target_date (datetime.date): 評価対象の棚卸日
+        loaded (dict): session_state.loaded（material/recipe/inventory/plan/actual_prod/actual_del）
+        base_days (int): 安全在庫の基準日数（既定3日）
+        yield_fusoku (float): 不測区分の歩留率（既定0.7、安全在庫=base_days×1日使用量÷歩留率）
+        yield_kasoku (float): 可測区分の歩留率（既定0.9）
+
+    Returns:
+        pd.DataFrame: 列は 原料JAN, 原料名, 原料区分, 対象区分,
+                            前回棚卸日, 前回棚卸数, 納品数, 使用量,
+                            論理在庫, 実在庫, 差, |差|,
+                            評価, 分類, 1日使用量, 安全在庫
+        ※ 並び順は仕様通り：原料区分の最小No順、同区分内では原料No順、最後に包材
+    """
+    material = loaded['material']
+    recipe = loaded['recipe']
+    inventory = loaded['inventory']
+    actual_prod = loaded['actual_prod']
+    actual_del = loaded['actual_del']
+    plan = loaded.get('plan', pd.DataFrame())
+
+    # ---- Step 1: 原料リスト（対象区分=対象外を除外、ソート） ----
+    mat = material.copy()
+    mat['原料JAN'] = mat['原料JAN'].astype(str).str.strip()
+    if '対象区分' in mat.columns:
+        mat = mat[mat['対象区分'] != '対象外'].copy()
+    mat['原料No_int'] = pd.to_numeric(mat.get('原料No'), errors='coerce')
+
+    # 原料区分の業務的並び順を取得（共通関数、2026/5/18 共通化）
+    sorted_categories = get_sorted_material_categories(material, exclude_target_gai=True)
+    cat_order_map = {cat: i for i, cat in enumerate(sorted_categories)}
+    # mat の各行に区分の並び順を付与（未知区分は末尾）
+    mat['_kubun_order'] = mat['原料区分'].map(cat_order_map).fillna(len(sorted_categories) + 1)
+    mat = mat.sort_values(['_kubun_order', '原料No_int', '原料名'], na_position='last').reset_index(drop=True)
+
+    mat_idx = mat.drop_duplicates('原料JAN').set_index('原料JAN')
+
+    # ---- Step 2: 前回棚卸 / 今回棚卸 ----
+    inv = inventory.copy()
+    inv['原料JAN'] = inv['原料JAN'].astype(str).str.strip()
+    inv['棚卸数_num'] = pd.to_numeric(inv['棚卸数'], errors='coerce').fillna(0.0)
+    inv_store = inv[inv['店舗名'] == store_name].copy()
+
+    today_inv = inv_store[inv_store['棚卸日_d'] == target_date]
+    today_dict = dict(zip(today_inv['原料JAN'], today_inv['棚卸数_num']))
+
+    prev_inv = inv_store[inv_store['棚卸日_d'] < target_date]
+    if len(prev_inv) > 0:
+        prev_inv_date = prev_inv['棚卸日_d'].max()
+        prev_rows = prev_inv[prev_inv['棚卸日_d'] == prev_inv_date]
+        prev_dict = dict(zip(prev_rows['原料JAN'], prev_rows['棚卸数_num']))
+        start_date = prev_inv_date + datetime.timedelta(days=1)
+    else:
+        prev_inv_date = None
+        prev_dict = {}
+        start_date = None  # 前回なしなら期間集計はスキップ
+    end_date = target_date
+
+    # ---- Step 2.5: 評価対象を「実棚卸データに登場する原料」に絞り込み（2026/5/15）----
+    # 業務的解釈：棚卸評価は実カウントされた原料の論理 vs 実の乖離を見るのが目的。
+    # 一度もカウントされていない原料は評価対象外（対象区分=対象外と同様、表示から除外）。
+    target_jans = set(today_dict.keys()) | set(prev_dict.keys())
+    mat = mat[mat['原料JAN'].isin(target_jans)].reset_index(drop=True)
+    mat_idx = mat.drop_duplicates('原料JAN').set_index('原料JAN')
+
+    # ---- Step 3a: 期間内納品数（actual_del） ----
+    delivery_dict = {}
+    if start_date is not None and len(actual_del) > 0:
+        adel = actual_del.copy()
+        adel['JAN'] = adel['JAN'].astype(str).str.strip()
+        adel['仕入計上数_num'] = pd.to_numeric(adel['仕入計上数'], errors='coerce').fillna(0.0)
+        adel_p = adel[
+            (adel['店舗名'] == store_name)
+            & (adel['納品予定日_d'] >= start_date)
+            & (adel['納品予定日_d'] <= end_date)
+        ]
+        delivery_dict = adel_p.groupby('JAN')['仕入計上数_num'].sum().to_dict()
+
+    # ---- Step 3b: 期間内使用量（actual_prod × recipe 展開） ----
+    rec = recipe.copy()
+    rec['JAN'] = rec['JAN'].astype(str).str.strip()
+    rec['原料JAN'] = rec['原料JAN'].astype(str).str.strip()
+    rec['使用量_num'] = pd.to_numeric(rec['使用量'], errors='coerce').fillna(0.0)
+
+    usage_dict = {}
+    if start_date is not None and len(actual_prod) > 0:
+        aprod = actual_prod.copy()
+        aprod['JAN'] = aprod['JAN'].astype(str).str.strip()
+        aprod['製造数_num'] = pd.to_numeric(aprod['製造数'], errors='coerce').fillna(0.0)
+        aprod_p = aprod[
+            (aprod['店舗名'] == store_name)
+            & (aprod['日付_d'] >= start_date)
+            & (aprod['日付_d'] <= end_date)
+        ]
+        prod_qty = aprod_p.groupby('JAN')['製造数_num'].sum().to_dict()
+        for _, r in rec.iterrows():
+            qty = prod_qty.get(r['JAN'], 0.0)
+            if qty == 0 or r['使用量_num'] == 0:
+                continue
+            total = qty * r['使用量_num']
+            m_jan = r['原料JAN']
+            if m_jan in mat_idx.index:
+                m_info = mat_idx.loc[m_jan]
+                kubun = m_info.get('原料区分', '')
+                nyusu = pd.to_numeric(m_info.get('入数', 1), errors='coerce')
+                if pd.isna(nyusu) or nyusu == 0:
+                    nyusu = 1
+            else:
+                kubun, nyusu = '', 1
+            u = total if kubun in HOUZAI_KUBUN else total / nyusu
+            usage_dict[m_jan] = usage_dict.get(m_jan, 0.0) + u
+
+    # ---- Step 4-6 の準備: 1日使用量（評価日から1週間の計画平均） ----
+    daily_usage_dict = {}
+    if len(plan) > 0:
+        plan_df = plan.copy()
+        plan_df['JAN'] = plan_df['JAN'].astype(str).str.strip()
+        plan_df['計画数_num'] = pd.to_numeric(plan_df['計画数'], errors='coerce').fillna(0.0)
+        week_end = target_date + datetime.timedelta(days=7)
+        plan_p = plan_df[
+            (plan_df.get('店舗名', store_name) == store_name)
+            & (plan_df['日付_d'] >= target_date)
+            & (plan_df['日付_d'] <= week_end)
+        ] if '店舗名' in plan_df.columns else plan_df[
+            (plan_df['日付_d'] >= target_date) & (plan_df['日付_d'] <= week_end)
+        ]
+        plan_qty = plan_p.groupby('JAN')['計画数_num'].sum().to_dict()
+        for _, r in rec.iterrows():
+            qty = plan_qty.get(r['JAN'], 0.0)
+            if qty == 0 or r['使用量_num'] == 0:
+                continue
+            total = qty * r['使用量_num']
+            m_jan = r['原料JAN']
+            if m_jan in mat_idx.index:
+                m_info = mat_idx.loc[m_jan]
+                kubun = m_info.get('原料区分', '')
+                nyusu = pd.to_numeric(m_info.get('入数', 1), errors='coerce')
+                if pd.isna(nyusu) or nyusu == 0:
+                    nyusu = 1
+            else:
+                kubun, nyusu = '', 1
+            u = total if kubun in HOUZAI_KUBUN else total / nyusu
+            daily_usage_dict[m_jan] = daily_usage_dict.get(m_jan, 0.0) + u
+        daily_usage_dict = {k: v / 7.0 for k, v in daily_usage_dict.items()}
+
+    # ---- Step 4-6 の本体: 各原料の論理・評価・分類 ----
+    rows = []
+    for _, m in mat.iterrows():
+        m_jan = m['原料JAN']
+        prev_stock = float(prev_dict.get(m_jan, 0.0))
+        delivery = float(delivery_dict.get(m_jan, 0.0))
+        usage = float(usage_dict.get(m_jan, 0.0))
+        logical = max(0.0, prev_stock + delivery - usage)
+        actual = float(today_dict.get(m_jan, 0.0))
+        diff = actual - logical
+        abs_diff = abs(diff)
+
+        if abs_diff <= 5:
+            eval_mark = '◎'
+        elif abs_diff <= 20:
+            eval_mark = '○'
+        elif abs_diff <= 30:
+            eval_mark = '△'
+        else:
+            eval_mark = '×'
+
+        daily = float(daily_usage_dict.get(m_jan, 0.0))
+        # 歩留率の処理（2026/5/18 修正）：松本君ロジックに合わせて歩留率で割る
+        # 可測なら ÷0.9、不測なら ÷0.7（calculate_flow と同じ式）
+        target_kbn = m.get('対象区分', '')
+        yf = yield_fusoku if target_kbn == '不測' else yield_kasoku
+        safety = (base_days * daily) / yf if yf > 0 else 0.0
+
+        # 分類ロジック（2026/5/18 修正）：
+        #   「実在庫＝不動＋アクティブ」が成立するように、'実在庫なし' を新カテゴリとして分離
+        #   - 実在庫 ≤ 0：実在庫なし（カウント漏れの可能性）
+        #   - 実在庫 > 0 かつ 納品=0 かつ 使用量=0：不動
+        #   - 実在庫 > 0 かつ 活動あり：過剰/過剰α/不足（従来通り）
+        if actual <= 0:
+            classification = '実在庫なし'
+        elif delivery == 0 and usage == 0:
+            classification = '不動'
+        elif safety <= 0:
+            classification = '過剰'  # 安全在庫=0だが活動あり → 計算上は過剰扱い
+        elif actual >= safety * 2:
+            classification = '過剰α'
+        elif actual >= safety:
+            classification = '過剰'
+        else:
+            classification = '不足'
+
+        rows.append({
+            '原料JAN': m_jan,
+            '原料名': m.get('原料名', ''),
+            '原料区分': m.get('原料区分', ''),
+            '対象区分': m.get('対象区分', ''),
+            '前回棚卸日': prev_inv_date,
+            '前回棚卸数': round(prev_stock, 3),
+            '納品数': round(delivery, 3),
+            '使用量': round(usage, 3),
+            '論理在庫': round(logical, 3),
+            '実在庫': round(actual, 3),
+            '差': round(diff, 3),
+            '|差|': round(abs_diff, 3),
+            '評価': eval_mark,
+            '分類': classification,
+            '1日使用量': round(daily, 3),
+            '安全在庫': round(safety, 3),
+        })
+
+    return pd.DataFrame(rows)
+
+
+# ========== キャッシュ付きラッパー ==========
+# calculate_flow は重い計算（多数の原料 × 多数の日付 × レシピ展開）なので、
+# 同じ条件での再計算を避けるためキャッシュする。
+#
+# 設計方針：
+#   - 引数はハッシュしやすいスカラー値だけにする（DataFrameを引数から外す）
+#   - 元データは st.session_state.loaded から関数内で参照する
+#   - adjustments は dict のままだとハッシュが不安定なので tuple 化してキー化
+#   - データ再取込時は外部からキャッシュをクリアする（後段でst.cache_data.clearを呼ぶ）
+@st.cache_data(show_spinner=False)
+def _calculate_flow_cached_impl(
+    store_name,
+    target_date,
+    base_days,
+    yield_fusoku,
+    yield_kasoku,
+    adjustments_key,   # tuple of (jan, value) でキャッシュキーとして使う
+    data_version,      # データ再取込のたびに変わる識別子（キャッシュ無効化用）
+):
+    """キャッシュ実体。data_version はキャッシュ無効化のためだけに使われる。"""
+    loaded = st.session_state.loaded
+    adjustments = dict(adjustments_key) if adjustments_key else {}
+    return calculate_flow(
+        store_name,
+        loaded['inventory'], loaded['plan'], loaded['actual_prod'],
+        loaded['plan_del'], loaded['actual_del'],
+        loaded['recipe'], loaded['material'],
+        target_date=target_date,
+        base_days=base_days,
+        yield_fusoku=yield_fusoku,
+        yield_kasoku=yield_kasoku,
+        adjustments=adjustments,
+    )
+
+
+def calculate_flow_cached(
+    store_name, target_date, base_days, yield_fusoku, yield_kasoku, adjustments
+):
+    """calculate_flow のキャッシュ付き版（呼出側はこちらを使う）"""
+    # adjustments を安定なキーに変換（dict はハッシュ不可 / tuple はハッシュ可）
+    adj_key = tuple(sorted((adjustments or {}).items()))
+    data_version = st.session_state.get('data_version', 0)
+    return _calculate_flow_cached_impl(
+        store_name, target_date, base_days, yield_fusoku, yield_kasoku,
+        adj_key, data_version,
+    )
+
+
+# ==========================================================
+# 📦 エリア在庫タブ用のラッパー（2026/5/18 追加）
+# ==========================================================
+# エリア（複数店舗）× 1原料 × 基準日〜+N日の在庫を集約。
+# 内部で各店舗の calculate_flow_cached を 2 回呼ぶ：
+#   - df_actual (target_date=params['target_date'])
+#       → 論理在庫＆予測在庫の取得（📉計画推移・📋実績推移と同じ）
+#   - df_plan   (target_date=None)
+#       → 1日使用量の取得（⓪余裕日数 と同じ）
+# 既存キャッシュが効くため、初回以外は高速。
+def get_area_inventory_data(
+    area_stores, material_jan, base_date,
+    base_days, yield_fusoku, yield_kasoku, target_date,
+    horizon_days=4, usage_window_days=7,
+):
+    """エリア内 N 店舗 × 1原料 × 基準日〜+horizon_days の在庫データを集約。
+
+    Returns:
+        pd.DataFrame: 列 = 店舗 / 最新棚卸日 / 実棚卸数 / 論理在庫 /
+        当日 / +1日 / ... / +N日 / 1日使用量 / 余裕日数 / ステータス
+    """
+    inv = st.session_state.loaded['inventory']
+
+    rows = []
+    for store in area_stores:
+        adj = get_adjustments_for_store(store)
+
+        # 1. df_actual：target_date まで実績、それ以降計画
+        df_act = calculate_flow_cached(
+            store, target_date, base_days, yield_fusoku, yield_kasoku, adj,
+        )
+        # 2. df_plan：全期間計画ベース（⓪余裕日数 と同じソース）
+        df_pln = calculate_flow_cached(
+            store, None, base_days, yield_fusoku, yield_kasoku, adj,
+        )
+
+        # 該当原料に絞る（空DataFrame＝計算対象データなし のケースを保護）
+        if '原料JAN' in df_act.columns:
+            sub_act = df_act[df_act['原料JAN'] == material_jan]
+        else:
+            sub_act = pd.DataFrame(columns=['日付', '残', '出'])
+        if '原料JAN' in df_pln.columns:
+            sub_pln = df_pln[df_pln['原料JAN'] == material_jan]
+        else:
+            sub_pln = pd.DataFrame(columns=['日付', '残', '出'])
+
+        # 基準日 〜 +horizon の「残」を取得
+        forecasts = []
+        for d in range(horizon_days + 1):
+            target = base_date + datetime.timedelta(days=d)
+            v = sub_act.loc[sub_act['日付'] == target, '残']
+            forecasts.append(float(v.iloc[0]) if len(v) > 0 else None)
+
+        # 1日使用量（df_pln から、基準日〜+usage_window）= ⓪余裕日数 と同じロジック
+        week_end = base_date + datetime.timedelta(days=usage_window_days)
+        usage_window = sub_pln[(sub_pln['日付'] >= base_date) & (sub_pln['日付'] <= week_end)]
+        daily_usage = float(usage_window['出'].mean()) if len(usage_window) > 0 else 0.0
+
+        # 実棚卸数（最新棚卸日）
+        inv_store = inv[
+            (inv['店舗名'] == store)
+            & (inv['原料JAN'].astype(str).str.strip() == material_jan)
+        ]
+        if len(inv_store) > 0:
+            latest_date = inv_store['棚卸日_d'].max()
+            qty_v = inv_store.loc[inv_store['棚卸日_d'] == latest_date, '棚卸数']
+            try:
+                latest_qty = float(pd.to_numeric(qty_v.iloc[0], errors='coerce'))
+            except Exception:
+                latest_qty = None
+        else:
+            latest_date, latest_qty = None, None
+
+        # 余裕日数 & ステータス
+        logical_today = forecasts[0]
+        if daily_usage <= 0:
+            margin_days = None
+            status = '— 使用予定なし'
+        elif logical_today is None:
+            margin_days = None
+            status = '— データなし'
+        else:
+            margin_days = logical_today / daily_usage
+            if margin_days < 2:
+                status = '🚨 危険'
+            elif margin_days <= 4:
+                status = '⚠️ 注意'
+            else:
+                status = '✅ 安全'
+
+        row = {
+            '店舗': store,
+            '最新棚卸日': latest_date,
+            '実棚卸数': latest_qty,
+            '論理在庫': logical_today,
+        }
+        for d in range(horizon_days + 1):
+            label = '当日' if d == 0 else f'+{d}日'
+            row[label] = forecasts[d]
+        row['1日使用量'] = daily_usage
+        row['余裕日数'] = margin_days
+        row['ステータス'] = status
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# ==========================================================
+# エリア在庫の移動候補サジェスト（2026/5/18 追加）
+# ==========================================================
+# 不足候補（余裕日数<2日）× 過剰候補（余裕日数>4日）の組合せから、
+# 両店舗の余裕日数を目標値（既定5日）に近づける移動量を提示。
+# 「— 使用予定なし」「⚠️ 注意」はサジェスト対象外。
+TARGET_MARGIN_DAYS = 5
+
+
+def calculate_move_suggestions(df_area, target_margin_days=TARGET_MARGIN_DAYS):
+    """過剰候補 → 不足候補 の移動ペアと推奨移動量を計算。
+
+    Returns:
+        (suggestions_df, info_msg, unfulfilled_msg)
+        - suggestions_df: 移動候補一覧 (空 DataFrame の場合あり)
+        - info_msg: 不足候補なし／過剰候補なし時のメッセージ（あれば）
+        - unfulfilled_msg: 移動後も不足が残る場合のメッセージ（あれば）
+    """
+    df_calc = df_area[df_area['余裕日数'].notna()].copy()
+
+    shortage = df_calc[df_calc['余裕日数'] < 2].sort_values('余裕日数', ascending=True)
+    surplus = df_calc[df_calc['余裕日数'] > 4].sort_values('余裕日数', ascending=False)
+
+    if len(shortage) == 0:
+        return pd.DataFrame(), '✅ 現在、エリア内に不足候補（🚨 危険）はありません。', None
+    if len(surplus) == 0:
+        return pd.DataFrame(), (
+            '⚠️ 過剰候補（✅ 安全）がエリア内になく、エリア内移動では解決できません。'
+            '**外部発注の検討が必要** です。'
+        ), None
+
+    # 過剰店の「余剰量」を初期化（目標日数を確保した上で余る分）
+    surplus_list = []
+    for _, r in surplus.iterrows():
+        available = r['論理在庫'] - target_margin_days * r['1日使用量']
+        if available > 0:
+            surplus_list.append({
+                'store': r['店舗'],
+                'available': float(available),
+                'logical': float(r['論理在庫']),
+                'daily_usage': float(r['1日使用量']),
+                'margin_curr': float(r['余裕日数']),
+            })
+
+    if not surplus_list:
+        return pd.DataFrame(), (
+            '⚠️ 過剰候補は存在しますが、目標日数'
+            f'（{target_margin_days}日）を確保できるだけの余剰が見つかりません。'
+        ), None
+
+    suggestions = []
+    unfulfilled = []
+
+    for _, ns in shortage.iterrows():
+        need = target_margin_days * ns['1日使用量'] - ns['論理在庫']
+        if need <= 0:
+            continue
+
+        store_logical = float(ns['論理在庫'])
+        store_usage = float(ns['1日使用量'])
+        store_margin_curr = float(ns['余裕日数'])
+        remaining = float(need)
+
+        for sd in surplus_list:
+            if remaining <= 0 or sd['available'] <= 0:
+                continue
+            move = min(remaining, sd['available'])
+
+            new_logical_to = store_logical + move
+            new_margin_to = new_logical_to / store_usage if store_usage > 0 else None
+            new_logical_from = sd['logical'] - move
+            new_margin_from = (new_logical_from / sd['daily_usage']
+                               if sd['daily_usage'] > 0 else None)
+
+            suggestions.append({
+                '移動元': sd['store'],
+                '元 余裕（前→後）': (
+                    f"{sd['margin_curr']:.1f}日 → {new_margin_from:.1f}日"
+                    if new_margin_from is not None else f"{sd['margin_curr']:.1f}日 → —"
+                ),
+                '推奨移動量': round(move, 1),
+                '移動先': ns['店舗'],
+                '先 余裕（前→後）': (
+                    f"{store_margin_curr:.1f}日 → {new_margin_to:.1f}日"
+                    if new_margin_to is not None else f"{store_margin_curr:.1f}日 → —"
+                ),
+            })
+
+            # 状態更新
+            sd['available'] -= move
+            sd['logical'] = new_logical_from
+            sd['margin_curr'] = new_margin_from if new_margin_from is not None else 0
+            store_logical = new_logical_to
+            store_margin_curr = new_margin_to if new_margin_to is not None else 0
+            remaining -= move
+
+        if remaining > 0:
+            unfulfilled.append({
+                'store': ns['店舗'],
+                'remaining': round(remaining, 1),
+                'final_margin': store_margin_curr,
+            })
+
+    unfulfilled_msg = None
+    if unfulfilled:
+        items = '、'.join(
+            f"{u['store']}（不足残 {u['remaining']:.1f} / 余裕日数 {u['final_margin']:.1f}日）"
+            for u in unfulfilled
+        )
+        unfulfilled_msg = (
+            f"⚠️ 以下の店舗は提案ペア後も不足が残ります：{items}。"
+            "**外部発注の検討が必要** です。"
+        )
+
+    return pd.DataFrame(suggestions), None, unfulfilled_msg
+
+
+# ========== セッション初期化 ==========
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+if 'store_params' not in st.session_state:
+    st.session_state.store_params = {}
+if 'adjustments' not in st.session_state:
+    # adjustments[(店舗名, 原料JAN)] = {'補正値': float, '種別': str, 'メモ': str, '更新日': str}
+    st.session_state.adjustments = load_adjustments_from_disk()
+if 'data_version' not in st.session_state:
+    # データ再取込のたびにインクリメント。キャッシュ無効化のキーとして使う。
+    st.session_state.data_version = 0
+
+# 起動時：ディスクから保存済みデータを自動読込
+if not st.session_state.data_loaded:
+    saved = load_data_from_disk()
+    if saved:
+        st.session_state.loaded = saved['loaded']
+        st.session_state.last_update = saved['last_update']
+        st.session_state.stores = saved['stores']
+        st.session_state.data_loaded = True
+
+
+# ========== サイドバー ==========
+def process_uploaded_files(uploaded_files):
+    """アップロードされたCSVを処理してsession_stateに保存"""
+    loaded = {}
+    for f in uploaded_files:
+        df = load_csv_from_upload(f)
+        kind = detect_file_kind(df)
+        if kind:
+            loaded[kind] = df
+    
+    required = ['recipe', 'material', 'plan', 'actual_prod', 'plan_del', 'actual_del', 'inventory']
+    missing = [k for k in required if k not in loaded]
+    if missing:
+        st.error(f"以下のファイルが不足: {missing}")
+        return False
+    
+    # 列名統一
+    if '店舗' in loaded['inventory'].columns:
+        loaded['inventory'] = loaded['inventory'].rename(columns={'店舗': '店舗名', 'CD': '店舗CD'})
+    if '店舗' in loaded['plan'].columns:
+        loaded['plan'] = loaded['plan'].rename(columns={'店舗': '店舗名', 'CD': '店舗CD'})
+    if '店CD' in loaded['actual_prod'].columns:
+        loaded['actual_prod'] = loaded['actual_prod'].rename(columns={'店CD': '店舗CD'})
+    
+    # 日付パース
+    loaded['inventory']['棚卸日_d'] = loaded['inventory']['棚卸日'].apply(parse_jp_date)
+    loaded['plan']['日付_d'] = loaded['plan']['日付'].apply(parse_jp_date)
+    loaded['actual_prod']['日付_d'] = loaded['actual_prod']['日付'].apply(parse_jp_date)
+    loaded['plan_del']['納品予定日_d'] = loaded['plan_del']['納品予定日'].apply(parse_jp_date)
+    loaded['actual_del']['納品予定日_d'] = loaded['actual_del']['納品予定日'].apply(parse_jp_date)
+    
+    st.session_state.loaded = loaded
+    st.session_state.data_loaded = True
+    st.session_state.last_update = datetime.datetime.now()  # 更新時刻を記録
+    st.session_state.stores = sorted(loaded['inventory']['店舗名'].dropna().unique().tolist())
+    
+    # ディスクに保存（他のブラウザからもアクセスできるように）
+    save_data_to_disk(loaded, st.session_state.last_update, st.session_state.stores)
+    
+    return True
+
+
+# ========== メインエリア ==========
+# タイトル・サブタイトルは削除（コントローラーには不要）
+# 開発・運用情報はサイドバーや下部で十分
+
+# ============ データ未取込時：取込UIを表示 ============
+if not st.session_state.data_loaded:
+    st.title("📊 在庫管理オペレーション基盤（初期セットアップ）")
+    st.info("📁 7つのCSVファイルをアップロードしてください（本部担当者が最初に1回行う作業）")
+    
+    uploaded_files = st.file_uploader(
+        "7つのCSVファイル（順不同・複数選択可）",
+        type=['csv'],
+        accept_multiple_files=True,
+        help="レシピ/原料/計画数/製造数/納品予定/実納品/棚卸の7ファイル"
+    )
+    
+    if uploaded_files:
+        if st.button("📥 データを取り込む", type="primary", use_container_width=True):
+            with st.spinner("読み込み中..."):
+                if process_uploaded_files(uploaded_files):
+                    # 計算キャッシュを無効化
+                    st.session_state.data_version = st.session_state.get('data_version', 0) + 1
+                    st.success(f"✅ 読込完了：{len(st.session_state.stores)}店舗")
+                    st.rerun()
+    
+    st.markdown("""
+    ### 必要なCSVファイル（順不同）
+    | ファイル | 主な列 |
+    |---|---|
+    | レシピデータ | 商品JAN・原料JAN・使用量 |
+    | 原料データ | 原料JAN・入数・原料区分・対象区分 |
+    | 計画数データ | 店舗・JAN・計画数・日付 |
+    | 製造数データ | 店舗名・JAN・製造数・日付 |
+    | 納品予定数 | 店舗名・JAN・納品予定数・納品予定日 |
+    | 実納品数データ | 店舗名・JAN・仕入計上数・納品予定日 |
+    | 棚卸データ | 店舗・JAN・棚卸数・棚卸日 |
+    """)
+    st.stop()
+
+# 店舗選択（見出しなし、ボタンだけ）
+if 'selected_store' not in st.session_state:
+    st.session_state.selected_store = st.session_state.stores[0]
+
+# 店舗選択（サイドバー、2026/5/19 タブレット向け：主画面を占領しない設計）
+with st.sidebar:
+    st.markdown("### 🏘️ 店舗選択")
+    new_store = st.radio(
+        "店舗",
+        st.session_state.stores,
+        index=st.session_state.stores.index(st.session_state.selected_store),
+        label_visibility="collapsed",
+        key='sidebar_store_radio',
+    )
+    if new_store != st.session_state.selected_store:
+        st.session_state.selected_store = new_store
+        # 店舗を切り替えたら、サマリーから引き継いだ原料フィルタをクリア
+        try:
+            f = DATA_DIR / 'focus_jans.txt'
+            if f.exists():
+                f.unlink()
+        except Exception:
+            pass
+        st.rerun()
+    st.caption("サイドバーは閉じても、選択は維持されます。")
+
+# 現在選択中の店舗（コンパクト表示、サイドバーが閉じてても店舗が分かるように残す）
+st.markdown(f"""
+<div style='
+    background: linear-gradient(135deg, #1e3a5f 0%, #2c5282 100%);
+    color: white;
+    padding: 6px 14px;
+    border-radius: 6px;
+    margin-bottom: 6px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+'>
+    <span style='font-size: 0.7rem; opacity: 0.85;'>現在表示中の店舗</span>
+    <span style='font-size: 1.15rem; font-weight: 700;'>🏪 {st.session_state.selected_store}</span>
+    <span style='font-size: 0.7rem; opacity: 0.7; margin-left: auto;'>店舗切替 → 左サイドバー（&gt; をタップ）</span>
+</div>
+""", unsafe_allow_html=True)
+
+selected_store = st.session_state.selected_store
+
+if selected_store not in st.session_state.store_params:
+    st.session_state.store_params[selected_store] = {
+        'base_days': 3,
+        'yield_fusoku': 0.7,
+        'yield_kasoku': 0.9,
+        'target_date': None,
+    }
+
+params = st.session_state.store_params[selected_store]
+
+actual_max = st.session_state.loaded['actual_prod']['日付_d'].max()
+actual_min = st.session_state.loaded['actual_prod']['日付_d'].min()
+if params['target_date'] is None:
+    params['target_date'] = actual_max
+
+# チューニング（折りたたみ）
+selected_store = st.session_state.selected_store
+params = st.session_state.store_params[selected_store]
+loaded = st.session_state.loaded
+
+
+def get_adjustments_for_store(store_name):
+    """指定店舗の補正値を {原料JAN: 補正値} 辞書で返す"""
+    result = {}
+    for (s, jan), data in st.session_state.adjustments.items():
+        if s == store_name and data.get('補正値', 0) != 0:
+            result[jan] = data['補正値']
+    return result
+
+
+current_adjustments = get_adjustments_for_store(selected_store)
+
+with st.spinner(f"{selected_store}の在庫推移を計算中..."):
+    df_plan = calculate_flow_cached(
+        selected_store,
+        target_date=None,
+        base_days=params['base_days'],
+        yield_fusoku=params['yield_fusoku'],
+        yield_kasoku=params['yield_kasoku'],
+        adjustments=current_adjustments,
+    )
+    
+    df_actual = calculate_flow_cached(
+        selected_store,
+        target_date=params['target_date'],
+        base_days=params['base_days'],
+        yield_fusoku=params['yield_fusoku'],
+        yield_kasoku=params['yield_kasoku'],
+        adjustments=current_adjustments,
+    )
+
+# ---- 管理対象フィルタを適用 ----
+# 設定ファイルがあれば df_plan / df_actual から該当原料だけを残す。
+# なければ全原料が対象（後方互換）。
+managed_jans_config = load_managed_jans(selected_store)
+df_plan = filter_by_managed_jans(df_plan, managed_jans_config)
+df_actual = filter_by_managed_jans(df_actual, managed_jans_config)
+
+opening_date = loaded['inventory'][loaded['inventory']['店舗名'] == selected_store]['棚卸日_d'].max()
+
+# 「管理対象を絞り込み中」バナーは 2026/5/19 タブレット向け簡略化で削除。
+# フィルタ状況は補助情報帯の「対象原料：N」で読み取れる。設定は⚙️設定タブで変更。
+
+# 補助情報帯：日付・原料数・補正数（店舗名は上部の大きな表示で出しているので重複させない）
+adj_count = len(current_adjustments)
+target_count = df_plan['原料JAN'].nunique() if len(df_plan) > 0 else 0
+
+st.markdown(f"""
+<div style='
+    background: #f0f4f8;
+    color: #1e3a5f;
+    padding: 5px 12px;
+    border-radius: 5px;
+    margin-bottom: 8px;
+    display: flex;
+    gap: 24px;
+    font-size: 0.85rem;
+    flex-wrap: wrap;
+    border-left: 3px solid #2c5282;
+'>
+    <span>📅 期首：<b>{opening_date}</b></span>
+    <span>🎯 実績指定日：<b>{params['target_date']}</b></span>
+    <span>📦 対象原料：<b>{target_count}</b></span>
+    <span>🔧 補正：<b>{adj_count}</b> 原料</span>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ========== タブ（2026/5/19 並び順変更：業務オペレーション順） ==========
+# 視覚順は新順番に。変数名 tab1〜tab10 は中身に紐づけて維持（既存の `with tabN:` ブロックを変更しない）。
+# 視覚順        変数名（中身）
+#  1: 仕込み指示      ← tab_shikomi（2026-05-30 追加：翌日以降の解凍数量）
+#  2: サマリー        ← tab1
+#  3: エリア在庫      ← tab8（既存：エリア在庫の中身）
+#  4: 棚卸カウント確認 ← tab_tana（2026-05-30 追加：見込み在庫数の予習画面）
+#  5: 棚卸評価        ← tab6
+#  6: 原料ピックアップ ← tab7
+#  7: 計画推移        ← tab2
+#  8: 実績推移        ← tab3
+#  9: ズレ補正        ← tab4
+# 10: シミュレーター   ← tab5
+# 11: 設定           ← tab9
+# 12: 管理者設定      ← tab10
+(tab_shikomi, tab1, tab8, tab_tana, tab6, tab7,
+ tab2, tab3, tab4, tab5,
+ tab9, tab10) = st.tabs([
+    "🍣 仕込み指示",
+    "📈 サマリー",
+    "📦 エリア在庫",
+    "📝 棚卸カウント確認",
+    "📊 棚卸評価",
+    "🔍 原料ピックアップ",
+    "📉 計画上の在庫推移",
+    "📋 実績上の在庫推移",
+    "🔧 ズレ補正",
+    "🔬 シミュレーター",
+    "⚙️ 設定",
+    "🛠️ 管理者設定",
+])
+
+
+def render_html_table(df, scope, pin_cols=None, col_formats=None, col_labels=None,
+                      col_align=None, pin_widths=None, cell_class_func=None,
+                      max_height=600, font_rem=1.0):
+    """汎用 sticky HTMLテーブル（タスクG-2 2026/6/3）。
+
+    在庫推移表(.flowtbl)の sticky パターンを流用し、表示専用の表を
+    「文字大・高コントラスト・行/列見出し固定」で描画する。st.dataframe の
+    インタラクティブ機能（ソート・列幅変更・セル選択）は持たない（現場未使用前提）。
+    既存ロジックには触れず、表示のみを置き換えるための純粋なレンダラ。
+
+    df          : 表示用 DataFrame（列順は表示順そのまま）。
+    scope       : CSSクラススコープ。タブ/表間で干渉しないようユニークにする。
+    pin_cols    : 左固定する列名リスト（左→右）。None なら先頭1列。
+    col_formats : {列名: '%.1f' 等}。数値のみ適用、NaN/None は空欄。
+    col_labels  : {列名: 表示見出し}。
+    col_align   : {列名: 'left'|'center'|'right'}。pin列は常に left、未指定の非pin列は right。
+    pin_widths  : {列名: px}。固定列の幅。未指定はデフォルト（先頭220, 以降110）。
+    cell_class_func: (列名, 生値)->追加CSSクラス（'neg'/'pos'/'ctr' 等。色付け用）。
+    max_height  : 縦スクロール上限px。font_rem: セル文字サイズ(rem)。
+    """
+    if df is None or len(df) == 0:
+        st.warning("データがありません")
+        return
+    cols = list(df.columns)
+    pin_cols = [c for c in (pin_cols or ([cols[0]] if cols else [])) if c in cols]
+    col_formats = col_formats or {}
+    col_labels = col_labels or {}
+    col_align = col_align or {}
+    pin_widths = pin_widths or {}
+
+    def esc(v):
+        return str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+    pin_index = {c: i for i, c in enumerate(pin_cols)}
+    # 固定列の left オフセット計算
+    widths = [int(pin_widths.get(c, 220 if i == 0 else 110)) for i, c in enumerate(pin_cols)]
+    lefts, acc = [], 0
+    for w in widths:
+        lefts.append(acc); acc += w
+
+    css = ['<style>']
+    css.append(f'.{scope}-wrap {{ overflow:auto; max-height:{max_height}px; border:1px solid #8a94a6; border-radius:4px; }}')
+    css.append(f'.{scope} {{ border-collapse:collapse; font-size:{font_rem}rem; white-space:nowrap; width:100%; }}')
+    css.append(f'.{scope} th {{ padding:8px 12px; border:1px solid #8a94a6; text-align:center; background:#cdd6e8; color:#16243b; font-weight:700; }}')
+    css.append(f'.{scope} thead tr {{ position:sticky; top:0; z-index:3; }}')
+    css.append(f'.{scope} td {{ padding:7px 12px; border:1px solid #aab2c0; color:#111; text-align:right; }}')
+    css.append(f'.{scope} td.lbl {{ text-align:left; overflow:hidden; text-overflow:ellipsis; }}')
+    css.append(f'.{scope} td.ctr {{ text-align:center; }}')
+    css.append(f'.{scope} tbody tr:nth-child(odd) td {{ background:#ffffff; }}')
+    css.append(f'.{scope} tbody tr:nth-child(even) td {{ background:#eef2f9; }}')
+    for i, (w, l) in enumerate(zip(widths, lefts)):
+        css.append(f'.{scope} .pc{i} {{ position:sticky; left:{l}px; min-width:{w}px; max-width:{w}px; z-index:1; }}')
+        css.append(f'.{scope} thead .pc{i} {{ z-index:4; left:{l}px; }}')
+    # 固定列セルの背景を不透明に（下の内容が透けないように）。even/odd を上書き。
+    css.append(f'.{scope} tbody tr:nth-child(odd) td.pcfix {{ background:#ffffff; }}')
+    css.append(f'.{scope} tbody tr:nth-child(even) td.pcfix {{ background:#e3e9f4; }}')
+    # 色付けクラス（コントラスト強化）
+    css.append(f'.{scope} td.neg {{ color:#b71c1c; font-weight:700; }}')
+    css.append(f'.{scope} td.pos {{ color:#1b5e20; font-weight:700; }}')
+    css.append('</style>')
+
+    out = [''.join(css), f'<div class="{scope}-wrap"><table class="{scope}">', '<thead><tr>']
+    for c in cols:
+        cls = f' class="pc{pin_index[c]} pcfix"' if c in pin_index else ''
+        out.append(f'<th{cls}>{esc(col_labels.get(c, c))}</th>')
+    out.append('</tr></thead><tbody>')
+    for _, row in df.iterrows():
+        out.append('<tr>')
+        for c in cols:
+            v = row[c]
+            if pd.isna(v):
+                disp = ''
+            elif c in col_formats and isinstance(v, (int, float, np.integer, np.floating)):
+                disp = col_formats[c] % float(v)
+            else:
+                disp = str(v)
+            classes = []
+            if c in pin_index:
+                classes.append(f'pc{pin_index[c]} pcfix lbl')
+            else:
+                a = col_align.get(c, 'right')
+                if a == 'left':
+                    classes.append('lbl')
+                elif a == 'center':
+                    classes.append('ctr')
+            if cell_class_func:
+                extra = cell_class_func(c, v)
+                if extra:
+                    classes.append(extra)
+            cls = f' class="{" ".join(classes)}"' if classes else ''
+            title = f' title="{esc(disp)}"' if c in pin_index else ''
+            out.append(f'<td{cls}{title}>{esc(disp)}</td>')
+        out.append('</tr>')
+    out.append('</tbody></table></div>')
+    st.markdown(''.join(out), unsafe_allow_html=True)
+
+
+def render_inventory_table(df, mode_label):
+    if len(df) == 0:
+        st.warning("データがありません")
+        return
+    
+    # ---- サマリーから引き継いだ原料フィルタ（focus_jans）の処理 ----
+    # 一時ファイル経由でタブ間共有（session_state ではタブ間で消えるため）
+    focus_jans_file = DATA_DIR / 'focus_jans.txt'
+    focus_jans = []
+    try:
+        if focus_jans_file.exists():
+            content = focus_jans_file.read_text(encoding='utf-8').strip()
+            if content:
+                focus_jans = [j for j in content.split(',') if j]
+    except Exception as e:
+        st.error(f"focus_jans読込エラー: {e}")
+    apply_focus = bool(focus_jans)
+    
+    if apply_focus:
+        # バナー表示：選択中の原料一覧と「クリア」ボタン
+        # 原料名を取得
+        focus_names = df[df['原料JAN'].isin(focus_jans)][['原料JAN', '原料名']].drop_duplicates()
+        n_focus = len(focus_names)
+        n_missing = len(focus_jans) - n_focus  # この店舗のデータに存在しない原料
+        
+        banner_col1, banner_col2 = st.columns([5, 1])
+        with banner_col1:
+            names_str = '、'.join(focus_names['原料名'].head(5).tolist())
+            if n_focus > 5:
+                names_str += f' 他{n_focus - 5}件'
+            msg = f"🔍 サマリーで選択された原料のみ表示中（{n_focus}件）：{names_str}"
+            if n_missing > 0:
+                msg += f"　※ {n_missing}件はこの店舗のデータにありません"
+            st.info(msg)
+        with banner_col2:
+            if st.button("クリア", key=f"clear_focus_{mode_label}", use_container_width=True):
+                # ファイルベースのfocus_jansを削除
+                try:
+                    f = DATA_DIR / 'focus_jans.txt'
+                    if f.exists():
+                        f.unlink()
+                except Exception:
+                    pass
+                st.rerun()
+    
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        # 2026/5/19：selectbox → radio に変更（タブレットでソフトキーボードを出さないため）。
+        # 「区分内の全原料を俯瞰表示」という業務的価値は変えず、絞り込みUIだけ変更。
+        kbn_options = ['全て'] + sorted(df['原料区分'].dropna().unique().tolist())
+        kbn = st.radio(
+            "原料区分",
+            kbn_options,
+            horizontal=True,
+            key=f"kbn_{mode_label}",
+            help="区分を選ぶと、その区分内の全原料を一覧表示",
+        )
+    with col2:
+        only_minus = st.checkbox("差マイナスのみ", value=False, key=f"minus_{mode_label}")
+    
+    df_view = df.copy()
+    
+    # focus_jans が有効ならまずそれで絞り込む
+    if apply_focus:
+        df_view = df_view[df_view['原料JAN'].isin(focus_jans)]
+    
+    if kbn != '全て':
+        df_view = df_view[df_view['原料区分'] == kbn]
+    
+    if only_minus:
+        bad_jans = df_view[df_view['差'] < 0]['原料JAN'].unique()
+        df_view = df_view[df_view['原料JAN'].isin(bad_jans)]
+    
+    if len(df_view) == 0:
+        st.warning("該当原料がありません")
+        return
+    
+    items = ['入', '出', '残', '安全在庫', '差']
+    pivot_dfs = []
+    for item in items:
+        p = df_view.pivot_table(
+            index=['原料JAN', '原料名', '原料区分', '対象区分'],
+            columns='日付', values=item, aggfunc='first'
+        )
+        p['項目'] = item
+        p = p.reset_index().set_index(['原料JAN', '原料名', '原料区分', '対象区分', '項目'])
+        pivot_dfs.append(p)
+    
+    combined = pd.concat(pivot_dfs).reset_index()
+    
+    item_order = {'入': 1, '出': 2, '残': 3, '安全在庫': 4, '差': 5}
+    combined['_o'] = combined['項目'].map(item_order)
+    combined = combined.sort_values(['原料JAN', '_o']).drop('_o', axis=1)
+    
+    weekday_jp = {'Mon':'月','Tue':'火','Wed':'水','Thu':'木','Fri':'金','Sat':'土','Sun':'日'}
+    date_cols = [c for c in combined.columns if isinstance(c, datetime.date)]
+    rename = {c: c.strftime(f'%m/%d({weekday_jp[c.strftime("%a")]})') for c in date_cols}
+    combined = combined.rename(columns=rename)
+    new_dates = list(rename.values())
+    
+    for c in new_dates:
+        combined[c] = pd.to_numeric(combined[c], errors='coerce').round(1)
+    
+    safety_lookup = {}
+    for _, r in combined[combined['項目']=='安全在庫'].iterrows():
+        safety_lookup[r['原料JAN']] = {dc: r[dc] for dc in new_dates}
+        
+    # ----- CSSを1回だけ定義し、各セルはclass参照のみ -----
+    # これによりHTML総量を大幅削減（インラインスタイル数千個 → class名数千個）
+    # スコープを区別するため mode_label をクラス名に含める
+    scope = f"flowtbl-{mode_label}"
+    css = f"""
+    <style>
+    .{scope}-wrap {{ overflow-x:auto; max-height:600px; overflow-y:auto;
+                     border:1px solid #ddd; border-radius:4px; }}
+    .{scope} {{ border-collapse:collapse; font-size:0.95rem; white-space:nowrap; width:100%; }}
+    .{scope} th {{ padding:7px 9px; border:1px solid #8a94a6; text-align:center; background:#cdd6e8; color:#16243b; font-weight:700; }}
+    .{scope} thead tr {{ position:sticky; top:0; z-index:3; }}
+    .{scope} td {{ padding:5px 9px; border:1px solid #aab2c0; color:#111; text-align:right; }}
+    .{scope} td.lbl {{ text-align:left; overflow:hidden; text-overflow:ellipsis; }}
+    /* 左側固定3列：sticky位置 + 幅 */
+    .{scope} .sc0 {{ position:sticky; left:0px;   min-width:240px; max-width:240px; z-index:1; }}
+    .{scope} .sc1 {{ position:sticky; left:240px; min-width:70px;  max-width:70px;  z-index:1; }}
+    .{scope} .sc2 {{ position:sticky; left:310px; min-width:70px;  max-width:70px;  z-index:1; }}
+    .{scope} thead .sc0 {{ z-index:4; min-width:240px; max-width:240px; left:0px; }}
+    .{scope} thead .sc1 {{ z-index:4; min-width:70px;  max-width:70px;  left:240px; }}
+    .{scope} thead .sc2 {{ z-index:4; min-width:70px;  max-width:70px;  left:310px; }}
+    .{scope} th.dt {{ min-width:75px; }}
+    /* 行ごとの背景色（項目別） */
+    .{scope} tr.r-zan  td {{ background:#e3f2fd; font-weight:bold; }}
+    .{scope} tr.r-sa   td {{ background:#fafafa; }}
+    .{scope} tr.r-base td {{ background:white; }}
+    /* 残セルの状態色（行背景を上書き）。タスクG-2でコントラスト強化 */
+    .{scope} td.bg-shortage {{ background:#ff9f9f !important; color:#7f0000; font-weight:bold; }}
+    .{scope} td.bg-excess   {{ background:#ffe066 !important; color:#5f4b00; }}
+    .{scope} td.bg-ok       {{ background:#9fd6a3 !important; color:#10401a; }}
+    /* 差マイナス */
+    .{scope} td.tx-minus {{ color:#c62828; font-weight:bold; }}
+    </style>
+    """
+        
+    html = [css]
+    html.append(f'<div class="{scope}-wrap"><table class="{scope}">')
+        
+    # ----- ヘッダ -----
+    sticky_cols = ['原料名', '対象区分', '項目']
+    html.append('<thead><tr>')
+    for i, col in enumerate(sticky_cols):
+        html.append(f'<th class="sc{i}">{col}</th>')
+    for col in new_dates:
+        html.append(f'<th class="dt">{col}</th>')
+    html.append('</tr></thead><tbody>')
+        
+    # ----- ボディ -----
+    item_to_rclass = {'残': 'r-zan', '差': 'r-sa'}  # それ以外は r-base
+    for _, row in combined.iterrows():
+        jan = row['原料JAN']
+        item = row['項目']
+        row_class = item_to_rclass.get(item, 'r-base')
+            
+        html.append(f'<tr class="{row_class}">')
+        # 左側3列（原料名・対象区分・項目）
+        label_vals = [str(row['原料名']), str(row['対象区分']), item]
+        for i, val in enumerate(label_vals):
+            html.append(f'<td class="sc{i} lbl" title="{val}">{val}</td>')
+            
+        # 日付セル
+        for dc in new_dates:
+            val = row[dc]
+            cell_class = ''
+                
+            if isinstance(val, (int, float)) and not pd.isna(val):
+                if item == '残':
+                    sv = safety_lookup.get(jan, {}).get(dc)
+                    if isinstance(sv, (int, float)) and not pd.isna(sv):
+                        if val < sv:
+                            cell_class = 'bg-shortage'
+                        elif val > sv * 2 and sv > 0:
+                            cell_class = 'bg-excess'
+                        else:
+                            cell_class = 'bg-ok'
+                elif item == '差':
+                    if val < 0:
+                        cell_class = 'tx-minus'
+                disp = f'{val:.1f}'
+            else:
+                disp = '-'
+                
+            if cell_class:
+                html.append(f'<td class="{cell_class}">{disp}</td>')
+            else:
+                html.append(f'<td>{disp}</td>')
+        html.append('</tr>')
+    html.append('</tbody></table></div>')
+        
+    st.markdown(''.join(html), unsafe_allow_html=True)
+    st.caption(
+        f"表示中：{combined['原料JAN'].nunique()} 原料 ｜ "
+        f"**残行の色**：🟢適正 🟥不足 🟨過剰 ｜ 差<0は赤字"
+    )
+
+
+with tab2:
+    st.subheader(f"📈 計画上の在庫推移（{selected_store}）")
+    st.caption(f"期首（{opening_date}）の棚卸数を起点に、納品予定と計画数で全期間を計算")
+    render_inventory_table(df_plan, '計画')
+
+
+with tab3:
+    st.subheader(f"📉 実績上の在庫推移（{selected_store}）")
+    st.caption(
+        f"期首（{opening_date}）から指定日（{params['target_date']}）まで実績で計算 → "
+        f"以降は計画で再計算"
+    )
+    render_inventory_table(df_actual, '実績')
+
+
+# ========== タブ：仕込み指示（2026-05-30 追加） ==========
+# 現場が毎朝開く最左タブ。今日〜1週間先の寿司ネタ解凍数量（パック）を一覧表示。
+# 計算：その日の計画数 × レシピ展開 → 必要量 ÷ 入数 → 切り上げ → パック数。
+# 在庫・納品予定は考慮しない（解凍は使用前提の工程のため）。
+with tab_shikomi:
+    st.subheader("🍣 仕込み指示")
+
+    today = datetime.date.today()
+    target_dates = [today + datetime.timedelta(days=i) for i in range(7)]  # 今日〜+6日
+    target_jans_shikomi = get_shikomi_targets_for_store(selected_store)
+
+    if not target_jans_shikomi:
+        st.info(
+            "**仕込み対象がまだ設定されていません。**\n\n"
+            "下の「⚙️ 仕込み対象の設定」（自動で開いています）で、"
+            "仕込み（解凍）したい**原料区分**（マグロ・サーモン等）を選んで保存してください。"
+        )
+    else:
+        st.caption(
+            f"店舗: {selected_store}　|　"
+            f"表示期間: {target_dates[0].strftime('%Y/%m/%d')} 〜 "
+            f"{target_dates[-1].strftime('%m/%d')}（7日分）　|　"
+            f"対象原料: {len(target_jans_shikomi)}件"
+        )
+
+        with st.spinner("仕込み量を計算中..."):
+            df_shikomi = compute_shikomi_for_store(selected_store, loaded, target_dates)
+
+        if len(df_shikomi) == 0:
+            st.info(
+                "対象期間に仕込みが必要な原料がありません。\n"
+                "（翌日以降の計画データが無い、もしくは対象原料が計画に含まれていない可能性があります）"
+            )
+        else:
+            weekday_jp = ['月', '火', '水', '木', '金', '土', '日']
+            date_label_map = {
+                d: f"{d.month}/{d.day}({weekday_jp[d.weekday()]})"
+                for d in target_dates
+            }
+            df_display = df_shikomi.rename(columns=date_label_map)
+            for _gi, (kbn, grp) in enumerate(df_display.groupby('原料区分', sort=False)):
+                st.markdown(f"#### 🔸 {kbn}")
+                display_cols = ['原料名', '入数'] + [date_label_map[d] for d in target_dates]
+                grp_show = grp[display_cols].copy()
+                for c in [date_label_map[d] for d in target_dates]:
+                    grp_show[c] = grp_show[c].apply(lambda x: '' if x == 0 else f"{float(x):.1f}")  # [タスクH]
+                # タスクG-2：sticky HTML表（原料名固定・文字大）。日付セルは右寄せ既定。
+                render_html_table(
+                    grp_show, scope=f"htbl-shikomi-{_gi}",
+                    pin_cols=['原料名'], pin_widths={'原料名': 240},
+                    max_height=520,
+                )
+            st.caption(
+                "※ 数値はパック単位（切り上げ）。空欄は0パック。"
+                "計画が変更されると次回の取込で反映されます。"
+            )
+
+    # ---- 仕込み対象の設定（区分でまとめて選ぶ方式：2026-05-30 UI改善） ----
+    # 「対象にする原料区分を選ぶ→保存」を主操作にし、初見でも迷わない導線にする。
+    # 個別の例外・店舗別上書きは副次的な折りたたみに分離。
+    st.markdown("---")
+    material_df_sk = loaded.get('material')
+    _setup_open = not target_jans_shikomi  # 未設定なら最初から開く
+    with st.expander("⚙️ 仕込み対象の設定", expanded=_setup_open):
+        if material_df_sk is None or len(material_df_sk) == 0:
+            st.info("原料マスタが読込まれていません。")
+        else:
+            name_map_sk = dict(zip(material_df_sk['原料JAN'].astype(str), material_df_sk['原料名']))
+
+            def _sk_label(j):
+                nm = name_map_sk.get(j, '')
+                return f"{nm}（{j}）" if nm else j
+
+            # 現在の対象（ベース層の TRUE）
+            base_df = load_shikomi_target_base()
+            cur_targets = set()
+            if len(base_df) > 0:
+                cur_targets = set(base_df[base_df['仕込み対象'].str.upper() == 'TRUE']['原料JAN'])
+
+            # 区分一覧（業務的並び順：寿司ネタが先頭）
+            ordered_kbn = get_sorted_material_categories(material_df_sk, exclude_target_gai=False)
+            cur_on_kbn = sorted(
+                set(material_df_sk[material_df_sk['原料JAN'].astype(str).isin(cur_targets)]['原料区分'].dropna()),
+                key=lambda k: ordered_kbn.index(k) if k in ordered_kbn else 999,
+            )
+
+            st.markdown("##### ① 仕込み対象にする原料区分を選ぶ")
+            sel_kbn = st.multiselect(
+                "原料区分（複数選択可）",
+                ordered_kbn,
+                default=cur_on_kbn,
+                key="sk_kbn_select",
+                help="選んだ区分の原料すべてが仕込み（解凍）対象になります。寿司ネタ区分が上に並びます。",
+            )
+            st.markdown("##### ② 保存する")
+            if st.button("💾 選んだ区分を仕込み対象にする", key="sk_save_kbn", type="primary"):
+                out = material_df_sk[['原料JAN', '原料名', '原料区分']].copy()
+                out['仕込み対象'] = out['原料区分'].isin(sel_kbn).map({True: 'TRUE', False: 'FALSE'})
+                save_shikomi_target_base(out)
+                st.success(f"{int((out['仕込み対象'] == 'TRUE').sum())}原料を仕込み対象にしました。")
+                st.rerun()
+
+            # 現在の対象サマリー
+            if cur_targets:
+                bd = (material_df_sk[material_df_sk['原料JAN'].astype(str).isin(cur_targets)]
+                      .groupby('原料区分').size())
+                bd = bd.reindex([k for k in ordered_kbn if k in bd.index])
+                parts = '・'.join(f"{k}{int(v)}" for k, v in bd.items())
+                st.info(f"✅ 現在の仕込み対象：**{len(cur_targets)}原料**（{parts}）")
+            else:
+                st.warning("まだ仕込み対象がありません。区分を選んで「💾 選んだ区分を仕込み対象にする」を押してください。")
+
+            # ② 個別の微調整（任意）
+            with st.expander("▶ 詳細調整：個別に追加・除外（任意）", expanded=False):
+                st.caption("区分での一括設定のあと、例外的に個別の原料を足したり外したりできます。")
+                off_jans = sorted(set(material_df_sk['原料JAN'].astype(str)) - cur_targets - {''})
+                incl = st.multiselect(
+                    "➕ 個別に追加する原料", off_jans, format_func=_sk_label, key="sk_incl",
+                )
+                excl = st.multiselect(
+                    "➖ 個別に除外する原料", sorted(cur_targets), format_func=_sk_label, key="sk_excl",
+                )
+                if st.button("💾 個別調整を保存", key="sk_save_indiv"):
+                    new_t = (cur_targets - set(excl)) | set(incl)
+                    out = material_df_sk[['原料JAN', '原料名', '原料区分']].copy()
+                    out['仕込み対象'] = out['原料JAN'].astype(str).isin(new_t).map({True: 'TRUE', False: 'FALSE'})
+                    save_shikomi_target_base(out)
+                    st.success("個別調整を保存しました。")
+                    st.rerun()
+
+            # ③ 店舗別の上書き（任意）
+            with st.expander("🏪 店舗別の上書き（この店舗だけ変えたいとき・任意）", expanded=False):
+                st.caption(f"店舗: **{selected_store}** だけベースと違う設定にしたいときに使います。")
+                override_df = load_shikomi_target_store_override()
+                store_override = override_df[override_df['店舗名'] == selected_store].copy()
+                if len(store_override) == 0:
+                    st.info("上書きはまだありません。ベース設定がそのまま使われます。")
+
+                oc1, oc2, oc3 = st.columns([3, 2, 1])
+                with oc1:
+                    mat_options = material_df_sk.assign(
+                        label=material_df_sk['原料JAN'].astype(str) + ' / ' + material_df_sk['原料名']
+                    )
+                    sel_label = st.selectbox(
+                        "原料", mat_options['label'].tolist(),
+                        key=f"sk_ovr_add_mat_{selected_store}",
+                    )
+                    sel_jan = sel_label.split(' / ')[0] if sel_label else None
+                with oc2:
+                    sel_flag = st.selectbox(
+                        "この店舗での扱い", ["対象にする（追加）", "対象から外す（除外）"],
+                        key=f"sk_ovr_add_flag_{selected_store}",
+                    )
+                with oc3:
+                    st.markdown(" ")
+                    if st.button("追加", key=f"sk_ovr_add_btn_{selected_store}"):
+                        flag_val = 'TRUE' if sel_flag.startswith('対象にする') else 'FALSE'
+                        new_row = pd.DataFrame([{
+                            '店舗名': selected_store, '原料JAN': sel_jan, '仕込み対象': flag_val,
+                        }])
+                        keep = ~((override_df['店舗名'] == selected_store) &
+                                 (override_df['原料JAN'] == sel_jan))
+                        save_shikomi_target_store_override(
+                            pd.concat([override_df[keep], new_row], ignore_index=True)
+                        )
+                        st.success("店舗別の上書きを追加しました。")
+                        st.rerun()
+
+                if len(store_override) > 0:
+                    show_df = store_override.merge(
+                        material_df_sk[['原料JAN', '原料名', '原料区分']],
+                        on='原料JAN', how='left',
+                    )[['原料JAN', '原料名', '原料区分', '仕込み対象']]
+                    st.dataframe(show_df, hide_index=True, use_container_width=True)
+                    del_jan = st.selectbox(
+                        "削除する原料JAN", store_override['原料JAN'].tolist(),
+                        key=f"sk_ovr_del_select_{selected_store}",
+                    )
+                    if st.button("選択した上書きを削除", key=f"sk_ovr_del_btn_{selected_store}"):
+                        keep = ~((override_df['店舗名'] == selected_store) &
+                                 (override_df['原料JAN'] == del_jan))
+                        save_shikomi_target_store_override(override_df[keep].reset_index(drop=True))
+                        st.success("店舗別の上書きを削除しました。")
+                        st.rerun()
+
+
+# ========== タブ1：サマリー（最初に異常検知） ==========
+# 新設計：3ブロック構成
+#   ① データ健全性（この計算結果を信じてよいかのチェック）
+#       A. 棚卸の鮮度
+#       B. 補正値の状況（A過渡期/B恒久的の集計、TOP10）
+#       C. 棚卸推移（複数日ある場合のみ：直近 − 前回の差分TOP）
+#   ② 実在庫の分類（期末時点の予測ベース）
+#   ③ 各分類の原料一覧（折りたたみ）
+#
+# ② の分類ツリー：
+#   実在庫
+#     ├─ 不動：期末残>0 AND 期中の入合計=0 AND 期中の出合計=0
+#     └─ 活動：上記以外（期末残>0 AND 動きあり）
+#          ├─ 過剰：残 > 安全在庫
+#          │    └─ 過α：残 > 安全在庫 × 2.0（過剰の中の極端版・確定値）
+#          └─ 不足：残 < 安全在庫
+with tab1:
+    # サマリーのタイトル・サブタイトルは削除（スペース節約・コントローラーには不要）
+
+    # --------------------------------------------------------
+    # 📊 データ反映状況（毎日のデータ取込が正しく反映されているか確認）
+    # --------------------------------------------------------
+    # 各データテーブルの「いつまでのデータか」と input_processed/ から推定した
+    # 「いつ取り込んだか」を種別ごとに表示。判定マークは付けず、武田さんが事実を
+    # 見て自分で判断する設計。
+    #
+    # 最新日付：
+    #   ・計画データ：plan['日付_d'].max()
+    #   ・実績データ：actual_prod['日付_d'].max()
+    #   ・棚卸データ：inventory['棚卸日_d'].max()
+    #   ・納品実績  ：actual_del['納品予定日_d'].max()
+    #
+    # 最終取込日時：input_processed/ 内ファイル更新日時の最大値から推定
+    #   ・「実納品数」は「納品予定数」の部分文字列マッチ衝突を避けるため最優先で判定
+    st.markdown("### 📊 データ反映状況")
+
+    _loaded_ds = st.session_state.loaded
+
+    def _max_date_ds(df, col):
+        if df is None or len(df) == 0 or col not in df.columns:
+            return None
+        s = df[col].dropna()
+        return s.max() if len(s) > 0 else None
+
+    _latest_ds = {
+        'plan':        _max_date_ds(_loaded_ds.get('plan'),        '日付_d'),
+        'actual_prod': _max_date_ds(_loaded_ds.get('actual_prod'), '日付_d'),
+        'inventory':   _max_date_ds(_loaded_ds.get('inventory'),   '棚卸日_d'),
+        'actual_del':  _max_date_ds(_loaded_ds.get('actual_del'),  '納品予定日_d'),
+    }
+
+    _ip_dir_ds = Path(__file__).parent / 'input_processed'
+    _ingest_ds = {'plan': None, 'actual_prod': None, 'inventory': None, 'actual_del': None}
+    if _ip_dir_ds.exists():
+        _mtimes_ds = {k: [] for k in _ingest_ds}
+        for _f_ds in _ip_dir_ds.iterdir():
+            if not _f_ds.is_file() or _f_ds.suffix.lower() != '.csv':
+                continue
+            _name_ds = _f_ds.name
+            _mt_ds = _f_ds.stat().st_mtime
+            if '実納品数' in _name_ds:
+                _mtimes_ds['actual_del'].append(_mt_ds)
+            elif '納品予定数' in _name_ds or '計画数' in _name_ds:
+                _mtimes_ds['plan'].append(_mt_ds)
+            elif '製造数' in _name_ds:
+                _mtimes_ds['actual_prod'].append(_mt_ds)
+            elif '棚卸' in _name_ds:
+                _mtimes_ds['inventory'].append(_mt_ds)
+        for _k_ds, _lst_ds in _mtimes_ds.items():
+            if _lst_ds:
+                _ingest_ds[_k_ds] = datetime.datetime.fromtimestamp(max(_lst_ds))
+
+    def _fmt_date_ds(d):
+        return d.strftime('%Y/%m/%d') if d else '-'
+
+    def _fmt_dt_ds(dt):
+        return dt.strftime('%Y/%m/%d %H:%M') if dt else '-'
+
+    _rows_ds = [
+        ('計画データ', _latest_ds['plan'],        _ingest_ds['plan']),
+        ('実績データ', _latest_ds['actual_prod'], _ingest_ds['actual_prod']),
+        ('棚卸データ', _latest_ds['inventory'],   _ingest_ds['inventory']),
+        ('納品実績  ', _latest_ds['actual_del'],  _ingest_ds['actual_del']),
+    ]
+    _md_ds = "\n".join(
+        f"- **{_label}**：{_fmt_date_ds(_d)} まで（最終取込 {_fmt_dt_ds(_dt)}）"
+        for _label, _d, _dt in _rows_ds
+    )
+    st.markdown(_md_ds)
+    st.divider()
+
+    # --------------------------------------------------------
+    # ⓪ 今日の余裕日数（コントローラーが朝一に見るべき指標）
+    # --------------------------------------------------------
+    # 「現在残 ÷ 1日あたり使用予定量 = 余裕日数」を計算し、短い順に並べる。
+    # コントローラーの「今日・明日、何か起きそうか」という時間軸に応える。
+    #
+    # 仕様：
+    #   ・現在残：df_actual の today（または最も近い日付）の残を使用
+    #            → 棚卸日から今日までを実績ベースで推移させた値
+    #   ・1日あたり使用量：df_plan の today～today+7日の「出」の平均
+    #            → 直近1週間の使用予定量
+    #   ・閾値：🚨危険 <2日 / ⚠️注意 2〜4日 / ✅安全 >4日（2026/5/13 改定）
+    #     根拠：発注締め時刻＋納品リードタイムを考慮した運用アクションライン
+    #           （詳細は CLAUDE.md §4.0.1「閾値の業務的根拠」参照）
+    #   ・「出」が0の原料（使用予定なし）は対象外
+    st.markdown("### ⓪ 今日の余裕日数")
+    st.caption("現在の在庫が、これから1週間の使用予定に対して何日分もつか。短い順に表示")
+    
+    today = datetime.date.today()
+    
+    if len(df_actual) > 0 and len(df_plan) > 0:
+        # ---- 1日あたり使用予定量（直近1週間平均）を原料ごとに算出 ----
+        week_end = today + datetime.timedelta(days=7)
+        df_plan_week = df_plan[
+            (df_plan['日付'] >= today) & 
+            (df_plan['日付'] <= week_end)
+        ].copy()
+        usage_per_day = df_plan_week.groupby('原料JAN')['出'].mean().reset_index()
+        usage_per_day.columns = ['原料JAN', '1日使用量']
+        
+        # ---- 現在残（today時点の推定残） ----
+        if today in df_actual['日付'].values:
+            current = df_actual[df_actual['日付'] == today].copy()
+        else:
+            past_dates = df_actual[df_actual['日付'] <= today]['日付']
+            if len(past_dates) > 0:
+                ref_date = past_dates.max()
+                current = df_actual[df_actual['日付'] == ref_date].copy()
+            else:
+                ref_date = df_actual['日付'].min()
+                current = df_actual[df_actual['日付'] == ref_date].copy()
+        current = current[['原料JAN', '原料名', '原料区分', '残']].rename(columns={'残': '現在残'})
+        
+        # ---- マージして余裕日数を計算 ----
+        df_buffer = current.merge(usage_per_day, on='原料JAN', how='left')
+        df_buffer['1日使用量'] = df_buffer['1日使用量'].fillna(0)
+        
+        df_active = df_buffer[df_buffer['1日使用量'] > 0].copy()
+        
+        if len(df_active) > 0:
+            df_active['余裕日数'] = df_active['現在残'] / df_active['1日使用量']
+            df_active = df_active.sort_values('余裕日数')
+            
+            danger = df_active[df_active['余裕日数'] < 2]
+            caution = df_active[(df_active['余裕日数'] >= 2) & (df_active['余裕日数'] <= 4)]
+            safe = df_active[df_active['余裕日数'] > 4]
+
+            mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+            mcol1.metric("🚨 危険（2日未満）", f"{len(danger)}件")
+            mcol2.metric("⚠️ 注意（2〜4日）", f"{len(caution)}件")
+            mcol3.metric("✅ 安全（4日超）", f"{len(safe)}件")
+            mcol4.metric("📦 集計対象", f"{len(df_active)}件", help="使用予定がある原料のみ")
+            
+            st.caption(
+                f"※ 集計基準日：{today}　/　使用量算出期間：{today}〜{week_end}（1週間平均）　/　"
+                f"使用予定なし {len(df_buffer) - len(df_active)} 件は対象外（②期末分類で確認）"
+            )
+            
+            critical = pd.concat([danger, caution]).sort_values('余裕日数')
+            
+            if len(critical) > 0:
+                st.markdown("**🚨 危険／⚠️注意 の原料一覧（余裕日数の短い順）**")
+                
+                disp = critical[['原料JAN', '原料名', '原料区分', '現在残', '1日使用量', '余裕日数']].copy()
+                disp['余裕日数'] = disp['余裕日数'].round(1)
+                disp['現在残'] = disp['現在残'].round(1)
+                disp['1日使用量'] = disp['1日使用量'].round(2)
+                def _state(v):
+                    if v < 2:
+                        return '🚨 危険'
+                    elif v <= 4:
+                        return '⚠️ 注意'
+                    else:
+                        return '✅ 安全'
+                disp.insert(0, '状態', disp['余裕日数'].apply(_state))
+                
+                # 列順を「重要な順」に並べ替え（状態 → 余裕日数 → 原料名 → 数値 → 区分 → JAN）
+                disp = disp[['状態', '余裕日数', '原料名', '現在残', '1日使用量', '原料区分', '原料JAN']]
+                
+                st.dataframe(
+                    disp,
+                    use_container_width=True,
+                    hide_index=True,
+                    # 行高を大きめに：1行50px × 件数 + ヘッダー60px
+                    height=min(550, 60 + len(disp) * 50),
+                    row_height=50,
+                    column_config={
+                        '状態': st.column_config.TextColumn('状態', width=90, pinned=True),
+                        '余裕日数': st.column_config.NumberColumn(
+                            '余裕日数', format='%.1f日', width=100,
+                            help='現在残÷1日使用量（小さいほど危険）',
+                        ),
+                        '原料名': st.column_config.TextColumn('原料名', width='large', pinned=True),
+                        '現在残': st.column_config.NumberColumn('現在残', format='%.1f', width=90),
+                        '1日使用量': st.column_config.NumberColumn('1日使用量', format='%.2f', width=100),
+                        '原料区分': st.column_config.TextColumn('区分', width=90),
+                        '原料JAN': st.column_config.TextColumn('JAN', width=120),
+                    },
+                )
+                st.caption("💡 危険／注意の原料は、発注システムで増減調整の対象になります。詳細は「📈 計画上の在庫推移」タブで確認できます。")
+            else:
+                st.success("✅ 危険・注意域の原料はありません（すべて安全域）")
+            
+            # --------------------------------------------------------
+            # 📤 サマリーをGoogle Chatに共有
+            # --------------------------------------------------------
+            with st.expander("📤 このサマリーをGoogle Chatに共有する", expanded=False):
+                # メッセージを生成
+                now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+                msg_lines = [
+                    f"🏪 *{selected_store}*（{now_str} 時点）",
+                    "",
+                    "📊 *余裕日数サマリー*",
+                    f"🚨 危険：{len(danger)}件",
+                    f"⚠️ 注意：{len(caution)}件",
+                    f"✅ 安全：{len(safe)}件",
+                ]
+                
+                # 危険原料 TOP5
+                if len(danger) > 0:
+                    msg_lines.append("")
+                    msg_lines.append(f"🚨 *危険原料 TOP{min(5, len(danger))}*")
+                    for _, r in danger.head(5).iterrows():
+                        msg_lines.append(
+                            f"・{r['原料名']}（余裕 {r['余裕日数']:.1f}日）"
+                        )
+                
+                # 注意原料 TOP3（危険が少ない時のみ）
+                if len(danger) < 3 and len(caution) > 0:
+                    msg_lines.append("")
+                    msg_lines.append(f"⚠️ *注意原料 TOP{min(3, len(caution))}*")
+                    for _, r in caution.head(3).iterrows():
+                        msg_lines.append(
+                            f"・{r['原料名']}(余裕 {r['余裕日数']:.1f}日)"
+                        )
+                
+                msg_lines.extend([
+                    "",
+                    f"📅 期首：{opening_date}",
+                    f"🎯 実績指定日：{params['target_date']}",
+                    f"🔧 補正適用：{adj_count}原料",
+                ])
+                
+                if managed_jans_config and managed_jans_config.get('jans'):
+                    msg_lines.append(f"🎯 管理対象：{len(managed_jans_config['jans'])}原料に絞り込み中")
+                
+                share_message = "\n".join(msg_lines)
+                
+                # プレビュー
+                st.markdown("**送信されるメッセージ（プレビュー）:**")
+                st.code(share_message, language=None)
+                
+                # 送信ボタン or コピー用テキスト
+                webhook_url = load_webhook_url()
+                if webhook_url:
+                    if st.button(
+                        "📤 Google Chatに送信",
+                        type='primary',
+                        use_container_width=True,
+                        key='_send_chat_btn',
+                    ):
+                        with st.spinner("送信中..."):
+                            result = send_to_google_chat(share_message, webhook_url)
+                        if result is True:
+                            st.success("✅ Google Chatに送信しました")
+                        else:
+                            st.error(f"❌ {result}")
+                    st.caption(
+                        "💡 送信先のGoogle Chatスペースを変更したい場合は、"
+                        "「🛠️ 管理者設定」タブで Webhook URL を更新してください"
+                    )
+                else:
+                    st.warning(
+                        "⚠️ Google Chatの Webhook URL が未設定です。"
+                        "上のテキストをコピーしてGoogle Chatに手動で貼り付けてください。"
+                    )
+                    st.caption(
+                        "💡 自動送信したい場合は、「🛠️ 管理者設定」タブで Webhook URL を設定してください。"
+                    )
+        else:
+            st.info("ℹ️ 使用予定がある原料がありません（計画期間や日付範囲を確認してください）")
+    else:
+        st.info("ℹ️ 計算データが揃っていません")
+    
+    st.divider()
+    
+    # --------------------------------------------------------
+    # ① データ健全性（計算結果を信じてよいかのチェック）
+    # --------------------------------------------------------
+    st.markdown("### ① データ健全性")
+    st.caption("②③の分類結果を解釈する前に、入力データと補正の状態を確認する")
+    
+    # ---- A. 棚卸の鮮度 ----
+    # 直近棚卸日からの経過日数。長いほど計算結果の信頼度が下がる。
+    today = datetime.date.today()
+    days_since_inv = None
+    if opening_date is not None:
+        try:
+            days_since_inv = (today - opening_date).days
+        except Exception:
+            days_since_inv = None
+    
+    # ---- B. 補正値の状況 ----
+    # 補正値そのものではなく「補正値の付き方」を集計する。
+    # CLAUDE.md §7.2 の運用観点：
+    #   A 過渡期が多い → データ整備で改善余地
+    #   B 恒久的が安定 → 現場の実態が掴めている
+    store_adj_full = {
+        jan: data
+        for (s, jan), data in st.session_state.adjustments.items()
+        if s == selected_store
+    }
+    # 「補正値が0でもメモだけ残す」ケースがあるので、評価は補正値ベースで分ける
+    adj_active = {jan: d for jan, d in store_adj_full.items() if d.get('補正値', 0) != 0}
+    n_adj_total = len(adj_active)
+    n_adj_a = sum(1 for d in adj_active.values() if d.get('種別') == 'A過渡期')
+    n_adj_b = sum(1 for d in adj_active.values() if d.get('種別') == 'B恒久的')
+    sum_abs_adj = sum(abs(float(d.get('補正値', 0) or 0)) for d in adj_active.values())
+    
+    # ---- C. 棚卸推移の有無を判定 ----
+    inv_all_store = loaded['inventory'][loaded['inventory']['店舗名'] == selected_store].copy()
+    inv_dates = sorted(inv_all_store['棚卸日_d'].dropna().unique())
+    has_multi_inv = len(inv_dates) >= 2
+    
+    # ---- メトリクス（A・Bを横並び）----
+    mc = st.columns(4)
+    if days_since_inv is None:
+        mc[0].metric("📅 棚卸からの経過", "-", help="棚卸日が取得できません")
+    else:
+        # 鮮度の感覚値：3日以内=◎、7日以内=○、それ以上=注意
+        if days_since_inv <= 3:
+            label = "新しい"
+        elif days_since_inv <= 7:
+            label = "やや古い"
+        else:
+            label = "古い"
+        mc[0].metric(
+            "📅 棚卸からの経過",
+            f"{days_since_inv} 日",
+            help=f"直近棚卸日：{opening_date}（{label}）"
+        )
+    mc[1].metric("🔧 補正適用中", f"{n_adj_total} 原料", help=f"｜補正値｜の合計：{sum_abs_adj:.1f}")
+    mc[2].metric("　└ A 過渡期", n_adj_a, help="データ整備で本来は解消すべきズレ")
+    mc[3].metric("　└ B 恒久的", n_adj_b, help="業務上、構造的に発生するズレ")
+    
+    # ---- B. 補正値が大きい原料 TOP（折りたたみ）----
+    if n_adj_total > 0:
+        with st.expander(f"補正値が大きい原料 TOP10（{n_adj_total} 原料中）", expanded=False):
+            mat_idx = loaded['material'][['原料JAN', '原料名', '原料区分']].drop_duplicates(subset=['原料JAN'])
+            adj_rows = []
+            for jan, d in adj_active.items():
+                val = float(d.get('補正値', 0) or 0)
+                adj_rows.append({
+                    '原料JAN': jan,
+                    '補正値': val,
+                    '｜補正値｜': abs(val),
+                    '種別': d.get('種別', ''),
+                    'メモ': d.get('メモ', ''),
+                })
+            df_adj = pd.DataFrame(adj_rows).merge(mat_idx, on='原料JAN', how='left')
+            df_adj = df_adj.sort_values('｜補正値｜', ascending=False).head(10)
+            disp_adj = df_adj[['原料名', '原料区分', '種別', '補正値', 'メモ']].copy()
+            disp_adj['補正値'] = disp_adj['補正値'].round(1)
+            st.dataframe(disp_adj, use_container_width=True, hide_index=True)
+            st.caption(
+                "※ A過渡期はデータ整備チームに連携、B恒久的は安定値かを定期確認"
+            )
+    
+    # ---- C. 棚卸推移（複数日ある場合のみ）----
+    if has_multi_inv:
+        latest_date = inv_dates[-1]
+        prev_date = inv_dates[-2]
+        with st.expander(f"棚卸推移：{prev_date} → {latest_date} の変化が大きい原料 TOP10", expanded=False):
+            inv_latest = inv_all_store[inv_all_store['棚卸日_d'] == latest_date].groupby('JAN')['棚卸数'].sum()
+            inv_prev = inv_all_store[inv_all_store['棚卸日_d'] == prev_date].groupby('JAN')['棚卸数'].sum()
+            # 両方の和集合で比較（片方しかなければ 0 として扱う）
+            all_jans = set(inv_latest.index) | set(inv_prev.index)
+            diff_rows = []
+            for jan in all_jans:
+                v_now = float(inv_latest.get(jan, 0) or 0)
+                v_prev = float(inv_prev.get(jan, 0) or 0)
+                diff_rows.append({
+                    '原料JAN': jan,
+                    f'{prev_date}': v_prev,
+                    f'{latest_date}': v_now,
+                    '差分': v_now - v_prev,
+                    '｜差分｜': abs(v_now - v_prev),
+                })
+            df_diff = pd.DataFrame(diff_rows)
+            df_diff = df_diff[df_diff['｜差分｜'] > 0]  # 変化なしは除外
+            mat_idx2 = loaded['material'][['原料JAN', '原料名', '原料区分']].drop_duplicates(subset=['原料JAN'])
+            df_diff = df_diff.merge(mat_idx2, on='原料JAN', how='left')
+            df_diff = df_diff.sort_values('｜差分｜', ascending=False).head(10)
+            
+            if len(df_diff) > 0:
+                disp_diff = df_diff[['原料名', '原料区分', f'{prev_date}', f'{latest_date}', '差分']].copy()
+                for col in [f'{prev_date}', f'{latest_date}', '差分']:
+                    disp_diff[col] = disp_diff[col].round(1)
+                st.dataframe(disp_diff, use_container_width=True, hide_index=True)
+                st.caption(
+                    "※ 差分は『生の棚卸数の差』であり、期間中の入出庫を含む。"
+                    "純粋な論理-実のズレではなく、参考情報として表示。"
+                )
+            else:
+                st.info("変化のある原料はありません")
+    else:
+        st.caption(f"📌 棚卸推移：単一日（{opening_date}）のみのため非表示")
+    
+    st.divider()
+    
+    # --------------------------------------------------------
+    # ② 実在庫の分類（期末時点の予測ベース）
+    # --------------------------------------------------------
+    st.markdown("### ② 実在庫の分類（期末時点）")
+    st.caption("計画通りに進んだ場合の期末時点で、各原料がどの状態になるかを分類")
+    
+    # df_plan（計画上）をベースに分類する
+    # 期末（最終日）の状態と、期間中の入出合計を見る
+    if len(df_plan) > 0:
+        # 各原料ごとに期間中の入出合計、期末の残・安全在庫を集計
+        agg = df_plan.groupby('原料JAN').agg(
+            原料名=('原料名', 'first'),
+            原料区分=('原料区分', 'first'),
+            入合計=('入', 'sum'),
+            出合計=('出', 'sum'),
+        ).reset_index()
+        
+        # 期末（=最終日）の残と安全在庫を取る
+        last_date = df_plan['日付'].max()
+        df_last = df_plan[df_plan['日付'] == last_date][['原料JAN', '残', '安全在庫']].rename(
+            columns={'残': '期末残', '安全在庫': '期末安全在庫'}
+        )
+        agg = agg.merge(df_last, on='原料JAN', how='left')
+        agg['期末残'] = agg['期末残'].fillna(0)
+        agg['期末安全在庫'] = agg['期末安全在庫'].fillna(0)
+        
+        # 分類ロジック
+        def classify(row):
+            zan = row['期末残']
+            anz = row['期末安全在庫']
+            in_sum = row['入合計']
+            out_sum = row['出合計']
+            
+            # 期末残が無ければ「実在庫なし」
+            if zan <= 0:
+                return '在庫なし'
+            
+            # 不動：期末残あり AND 期間中の入出ゼロ
+            if in_sum == 0 and out_sum == 0:
+                return '不動'
+            
+            # 活動の中での分類
+            if zan < anz:
+                return '不足'
+            elif zan > anz * 2:
+                return '過α'
+            elif zan > anz:
+                return '過剰'
+            else:
+                return '活動（適正）'
+        
+        agg['分類'] = agg.apply(classify, axis=1)
+        
+        n_fudou = (agg['分類'] == '不動').sum()
+        n_kaa = (agg['分類'] == '過α').sum()
+        n_busoku = (agg['分類'] == '不足').sum()
+        n_kajou = (agg['分類'] == '過剰').sum()  # 過αを含まない通常の過剰
+        n_katsudo = (agg['分類'] == '活動（適正）').sum()
+        n_zero = (agg['分類'] == '在庫なし').sum()
+        n_total = len(agg)
+        
+        # メトリクス（最優先異常を左に）
+        c = st.columns(6)
+        c[0].metric("🔴 不動", n_fudou, help="最優先異常：期末残あり×期中の動きなし")
+        c[1].metric("🔴 過α", n_kaa, help="安全在庫の2倍超の過剰")
+        c[2].metric("🟡 不足", n_busoku, help="残 < 安全在庫")
+        c[3].metric("⚪ 過剰", n_kajou, help="安全在庫超〜2倍以下")
+        c[4].metric("🟢 活動(適正)", n_katsudo, help="安全在庫付近で動いている")
+        c[5].metric("在庫なし", n_zero, help="期末残ゼロ")
+        
+        # 構成比バー（合計から「在庫なし」を除外して表示）
+        n_jitsu = n_total - n_zero  # 実在する原料
+        if n_jitsu > 0:
+            bar2 = f"""
+            <div style="display:flex; height:24px; border-radius:4px; overflow:hidden; margin:8px 0; border:1px solid #ddd;">
+                <div style="width:{n_fudou/n_jitsu*100:.1f}%; background:#e53935;" title="不動 {n_fudou}"></div>
+                <div style="width:{n_kaa/n_jitsu*100:.1f}%; background:#ef5350;" title="過α {n_kaa}"></div>
+                <div style="width:{n_busoku/n_jitsu*100:.1f}%; background:#ffd54f;" title="不足 {n_busoku}"></div>
+                <div style="width:{n_kajou/n_jitsu*100:.1f}%; background:#bdbdbd;" title="過剰 {n_kajou}"></div>
+                <div style="width:{n_katsudo/n_jitsu*100:.1f}%; background:#81c784;" title="活動(適正) {n_katsudo}"></div>
+            </div>
+            <div style="font-size:0.85rem; color:#666;">
+                実在原料 {n_jitsu} 件中：
+                不動 {n_fudou/n_jitsu*100:.1f}% ／
+                過α {n_kaa/n_jitsu*100:.1f}% ／
+                不足 {n_busoku/n_jitsu*100:.1f}% ／
+                過剰 {n_kajou/n_jitsu*100:.1f}% ／
+                活動 {n_katsudo/n_jitsu*100:.1f}%
+            </div>
+            """
+            st.markdown(bar2, unsafe_allow_html=True)
+        
+        # ----------------------------------------------------
+        # ③ 各分類の原料一覧（折りたたみ）
+        # ----------------------------------------------------
+        st.markdown("### ③ 異常分類別の原料一覧")
+        st.caption("各分類の表の下にあるセレクトで原料を選び、『📊 推移を見る』を押すと計画／実績の在庫推移タブで該当原料に絞り込まれます。")
+        
+        def show_class_list(label, cls_name, color_label):
+            df_cls = agg[agg['分類'] == cls_name].copy()
+            count = len(df_cls)
+            with st.expander(f"{color_label} {label}（{count}件）", expanded=False):
+                if count == 0:
+                    st.info("該当なし")
+                    return
+                # 重要度順に並べる
+                if cls_name == '不動':
+                    df_cls = df_cls.sort_values('期末残', ascending=False)
+                elif cls_name == '過α':
+                    df_cls['超過倍率'] = df_cls['期末残'] / df_cls['期末安全在庫'].replace(0, 1)
+                    df_cls = df_cls.sort_values('超過倍率', ascending=False)
+                elif cls_name == '不足':
+                    df_cls['不足量'] = df_cls['期末安全在庫'] - df_cls['期末残']
+                    df_cls = df_cls.sort_values('不足量', ascending=False)
+                
+                # 上位100件に制限
+                df_cls_view = df_cls.head(100).copy()
+                
+                # 表は読み取り専用で表示
+                disp = df_cls_view[['原料JAN', '原料名', '原料区分', '期末残', '期末安全在庫', '入合計', '出合計']].copy()
+                for col in ['期末残', '期末安全在庫', '入合計', '出合計']:
+                    disp[col] = disp[col].round(1)
+                st.dataframe(disp, use_container_width=True, hide_index=True)
+                
+                if count > 100:
+                    st.caption(f"※ 上位100件を表示（全{count}件）")
+                
+                # 原料選択（multiselect）
+                # value は 原料JAN、表示ラベルは「原料名（JAN）」
+                jan_to_label = {
+                    r['原料JAN']: f"{r['原料名']}（{r['原料JAN']}）"
+                    for _, r in df_cls_view.iterrows()
+                }
+                selected_jans = st.multiselect(
+                    "推移を見たい原料を選択",
+                    options=list(jan_to_label.keys()),
+                    format_func=lambda j: jan_to_label.get(j, j),
+                    key=f"multisel_{cls_name}",
+                    placeholder="原料を選んでください（複数選択可）",
+                )
+                n_sel = len(selected_jans)
+                
+                bcol1, _bcol2 = st.columns([1, 2])
+                with bcol1:
+                    btn_clicked = st.button(
+                        f"📊 推移を見る（{n_sel}件）",
+                        key=f"goto_flow_{cls_name}",
+                        disabled=(n_sel == 0),
+                        use_container_width=True,
+                        help="計画／実績の両方の在庫推移タブで、選択した原料に絞り込まれます",
+                    )
+                    if btn_clicked:
+                        # ファイル経由でタブ間共有
+                        focus_jans_file = DATA_DIR / 'focus_jans.txt'
+                        try:
+                            focus_jans_file.write_text(
+                                ','.join(selected_jans), encoding='utf-8'
+                            )
+                        except Exception as e:
+                            st.error(f"保存エラー: {e}")
+                        st.toast(
+                            f"{n_sel}件を選択しました。"
+                            "「📈 計画上の在庫推移」または「📋 実績上の在庫推移」タブを開いてください。"
+                        )
+        
+        show_class_list("不動", '不動', '🔴')
+        show_class_list("過α（安全在庫の2倍超）", '過α', '🔴')
+        show_class_list("不足", '不足', '🟡')
+        show_class_list("過剰", '過剰', '⚪')
+        show_class_list("活動（適正）", '活動（適正）', '🟢')
+    else:
+        st.warning("計画データがないため、分類できません")
+    
+    st.divider()
+    
+    # --------------------------------------------------------
+    # 現在のチューニング設定（参考表示）
+    # --------------------------------------------------------
+    with st.expander("ℹ️ 現在のチューニング設定（参考）", expanded=False):
+        p_col = st.columns(3)
+        p_col[0].info(f"**基準日数**\n\n{params['base_days']} 日")
+        p_col[1].info(f"**歩留(不測)**\n\n{params['yield_fusoku']:.2f}")
+        p_col[2].info(f"**歩留(可測)**\n\n{params['yield_kasoku']:.2f}")
+
+
+# ========== タブ4：ズレ補正 ==========
+with tab4:
+    st.subheader(f"🔧 ズレ補正（{selected_store}）")
+    st.caption(
+        "**論理在庫と実在庫のズレを原料ごとに補正します。**"
+        " 棚卸数（期首在庫）に補正値が加算されます。"
+    )
+    
+    with st.expander("ℹ️ 種別の使い分け", expanded=False):
+        st.markdown("""
+        **A 過渡期**：データ整備で本来は解消すべきズレ。
+        
+        - 例：マスタの不備、データ計上漏れ、システム連携の遅延
+        - これらは齋藤さん・松本君に渡して仕組みで解消する材料
+        - 「いずれは0にしたい」補正
+        
+        **B 恒久的**：業務上、構造的に発生し続けるズレ。
+        
+        - 例：計量ロス、テスト分、切れ端の再利用
+        - これは仕組みで解消できないため、アプリで補正し続ける
+        - 補正値が安定しているもの
+        """)
+    
+    # 既存補正の取得
+    store_adjustments = {
+        jan: data for (s, jan), data in st.session_state.adjustments.items()
+        if s == selected_store
+    }
+    
+    # 補正対象の原料リスト
+    material_df_for_select = loaded['material'].copy()
+    
+    # 検索フィルタ
+    col_a, col_b, col_c = st.columns([2, 1, 1])
+    with col_a:
+        search = st.text_input("🔍 原料名で検索", "", key='adj_search')
+    with col_b:
+        filter_kbn = st.selectbox(
+            "種別でフィルタ",
+            ['すべて', 'A過渡期のみ', 'B恒久的のみ', '補正設定済みのみ'],
+            key='adj_filter'
+        )
+    with col_c:
+        st.write("")
+        st.write("")
+        if st.button("💾 変更を保存", type="primary", use_container_width=True):
+            save_adjustments_to_disk(st.session_state.adjustments)
+            st.success("保存しました")
+    
+    # 表示する原料を決定
+    df_show = material_df_for_select.copy()
+    if search:
+        df_show = df_show[df_show['原料名'].astype(str).str.contains(search, na=False)]
+    
+    if filter_kbn == '補正設定済みのみ':
+        df_show = df_show[df_show['原料JAN'].isin(store_adjustments.keys())]
+    elif filter_kbn == 'A過渡期のみ':
+        a_jans = [jan for jan, d in store_adjustments.items() if d.get('種別') == 'A過渡期']
+        df_show = df_show[df_show['原料JAN'].isin(a_jans)]
+    elif filter_kbn == 'B恒久的のみ':
+        b_jans = [jan for jan, d in store_adjustments.items() if d.get('種別') == 'B恒久的']
+        df_show = df_show[df_show['原料JAN'].isin(b_jans)]
+    
+    # 設定済み補正のサマリー
+    adj_count_a = sum(1 for d in store_adjustments.values() if d.get('種別') == 'A過渡期')
+    adj_count_b = sum(1 for d in store_adjustments.values() if d.get('種別') == 'B恒久的')
+    sum_col1, sum_col2, sum_col3 = st.columns(3)
+    sum_col1.metric("補正設定中", len(store_adjustments))
+    sum_col2.metric("A 過渡期", adj_count_a)
+    sum_col3.metric("B 恒久的", adj_count_b)
+    
+    st.divider()
+    st.markdown(f"**{len(df_show)} 件の原料を表示**")
+    st.caption("補正値を変更して「💾 変更を保存」をクリックすると、計算に反映されます")
+    
+    # 表示数を制限（パフォーマンスのため）
+    if len(df_show) > 100:
+        st.warning(f"表示が多すぎます（{len(df_show)}件）。検索やフィルタで絞り込んでください。先頭100件のみ表示します。")
+        df_show = df_show.head(100)
+    
+    # 各原料に対して補正設定UIを表示
+    for _, row in df_show.iterrows():
+        jan = row['原料JAN']
+        name = row['原料名']
+        kubun = row.get('原料区分', '')
+        
+        existing = store_adjustments.get(jan, {})
+        cur_val = existing.get('補正値', 0.0)
+        cur_kind = existing.get('種別', 'A過渡期')
+        cur_memo = existing.get('メモ', '')
+        cur_updated = existing.get('更新日', '')
+        
+        # 補正がある原料は強調表示
+        bg = "#fff8e1" if cur_val != 0 else "transparent"
+        
+        with st.container():
+            cols = st.columns([3, 1, 1, 3, 1])
+            cols[0].markdown(f"**{name}**  \n<small style='color:#888'>{kubun} ｜ JAN: {jan}</small>", unsafe_allow_html=True)
+            
+            new_val = cols[1].number_input(
+                "補正値", value=float(cur_val), step=1.0,
+                key=f"adj_val_{jan}",
+                label_visibility="collapsed",
+            )
+            
+            new_kind = cols[2].selectbox(
+                "種別",
+                ['A過渡期', 'B恒久的'],
+                index=0 if cur_kind == 'A過渡期' else 1,
+                key=f"adj_kind_{jan}",
+                label_visibility="collapsed",
+            )
+            
+            new_memo = cols[3].text_input(
+                "メモ", value=cur_memo,
+                key=f"adj_memo_{jan}",
+                label_visibility="collapsed",
+                placeholder="補正の理由（例：計量ロス、テスト分）"
+            )
+            
+            cols[4].caption(cur_updated if cur_updated else "未設定")
+            
+            # 値が変わったらセッションに反映（保存ボタンで永続化）
+            if new_val != cur_val or new_kind != cur_kind or new_memo != cur_memo:
+                if new_val == 0 and not new_memo:
+                    # ゼロかつメモなしなら削除
+                    if (selected_store, jan) in st.session_state.adjustments:
+                        del st.session_state.adjustments[(selected_store, jan)]
+                else:
+                    st.session_state.adjustments[(selected_store, jan)] = {
+                        '補正値': new_val,
+                        '種別': new_kind,
+                        'メモ': new_memo,
+                        '更新日': datetime.date.today().strftime('%Y-%m-%d'),
+                    }
+
+
+# ========== タブ5：シミュレーター ==========
+with tab5:
+    st.subheader(f"🔬 パラメータ Before/After シミュレーター（{selected_store}）")
+    st.caption(
+        "**「もしパラメータをこう変えたら、どう変わるか」を試す機能**"
+        " ｜ 現在の設定値を変えずに、仮の値で計算結果を比較できます"
+    )
+    
+    # 仮パラメータ設定UI
+    sim_cols = st.columns(3)
+    with sim_cols[0]:
+        st.markdown("**A：現在の設定（参考）**")
+        st.info(
+            f"基準日数：{params['base_days']} 日  \n"
+            f"歩留（不測）：{params['yield_fusoku']:.2f}  \n"
+            f"歩留（可測）：{params['yield_kasoku']:.2f}"
+        )
+    
+    with sim_cols[1]:
+        st.markdown("**B：仮の設定**")
+        sim_base = st.number_input(
+            "基準日数", min_value=1, max_value=14,
+            value=params['base_days'], step=1, key='sim_base'
+        )
+        sim_fusoku = st.number_input(
+            "歩留（不測）", min_value=0.1, max_value=1.0,
+            value=params['yield_fusoku'], step=0.05, format="%.2f", key='sim_fusoku'
+        )
+        sim_kasoku = st.number_input(
+            "歩留（可測）", min_value=0.1, max_value=1.0,
+            value=params['yield_kasoku'], step=0.05, format="%.2f", key='sim_kasoku'
+        )
+    
+    with sim_cols[2]:
+        st.markdown("**変更内容**")
+        diff_msg = []
+        if sim_base != params['base_days']:
+            diff_msg.append(f"基準日数 {params['base_days']}→{sim_base} 日")
+        if abs(sim_fusoku - params['yield_fusoku']) > 0.001:
+            diff_msg.append(f"歩留(不測) {params['yield_fusoku']:.2f}→{sim_fusoku:.2f}")
+        if abs(sim_kasoku - params['yield_kasoku']) > 0.001:
+            diff_msg.append(f"歩留(可測) {params['yield_kasoku']:.2f}→{sim_kasoku:.2f}")
+        
+        if diff_msg:
+            for m in diff_msg:
+                st.warning(m)
+        else:
+            st.success("変更なし")
+    
+    if not diff_msg:
+        st.info("👆 仮の設定を変更すると、Before/After比較が表示されます")
+    else:
+        st.divider()
+        
+        # 仮パラメータでも計算
+        with st.spinner("仮の設定で再計算中..."):
+            df_plan_sim = calculate_flow_cached(
+                selected_store,
+                target_date=None,
+                base_days=sim_base,
+                yield_fusoku=sim_fusoku,
+                yield_kasoku=sim_kasoku,
+                adjustments=current_adjustments,
+            )
+        
+        if len(df_plan_sim) == 0 or len(df_plan) == 0:
+            st.warning("計算結果がありません")
+        else:
+            # 全原料サマリー比較
+            st.markdown("### 📊 全原料サマリー比較（計画モード）")
+            
+            # 各原料ごとに、差マイナス日数の変化を集計
+            def summarize(df):
+                return df.groupby('原料JAN').agg(
+                    原料名=('原料名', 'first'),
+                    原料区分=('原料区分', 'first'),
+                    差マイナス日数=('差', lambda x: (x < 0).sum()),
+                    最小差=('差', 'min'),
+                    平均安全在庫=('安全在庫', 'mean'),
+                ).reset_index()
+            
+            sum_a = summarize(df_plan).rename(columns={
+                '差マイナス日数': '差マイナス_A',
+                '最小差': '最小差_A',
+                '平均安全在庫': '平均安全在庫_A',
+            })
+            sum_b = summarize(df_plan_sim).rename(columns={
+                '差マイナス日数': '差マイナス_B',
+                '最小差': '最小差_B',
+                '平均安全在庫': '平均安全在庫_B',
+            })
+            
+            merged = sum_a.merge(
+                sum_b[['原料JAN', '差マイナス_B', '最小差_B', '平均安全在庫_B']],
+                on='原料JAN', how='outer'
+            ).fillna(0)
+            
+            # 変化量を計算
+            merged['差マイナス変化'] = merged['差マイナス_B'] - merged['差マイナス_A']
+            merged['安全在庫変化率'] = (
+                (merged['平均安全在庫_B'] - merged['平均安全在庫_A']) /
+                merged['平均安全在庫_A'].replace(0, 1) * 100
+            ).round(1)
+            
+            # サマリー指標
+            m_col = st.columns(4)
+            
+            tot_a = int(merged['差マイナス_A'].sum())
+            tot_b = int(merged['差マイナス_B'].sum())
+            change = tot_b - tot_a
+            
+            m_col[0].metric("差マイナス日数（A）", tot_a)
+            m_col[1].metric("差マイナス日数（B）", tot_b, delta=int(change), delta_color="inverse")
+            
+            worse_count = int((merged['差マイナス変化'] > 0).sum())
+            better_count = int((merged['差マイナス変化'] < 0).sum())
+            m_col[2].metric("悪化した原料", worse_count, delta_color="inverse")
+            m_col[3].metric("改善した原料", better_count)
+            
+            st.divider()
+            
+            # 変化の大きい原料を表示
+            st.markdown("### 🔍 影響が大きい原料 TOP20")
+            
+            # 変化量で並び替え
+            merged['変化絶対値'] = merged['差マイナス変化'].abs()
+            top_changed = merged.sort_values('変化絶対値', ascending=False).head(20)
+            
+            display_df = top_changed[[
+                '原料名', '原料区分',
+                '差マイナス_A', '差マイナス_B', '差マイナス変化',
+                '平均安全在庫_A', '平均安全在庫_B', '安全在庫変化率',
+            ]].copy()
+            display_df.columns = [
+                '原料名', '原料区分',
+                'A:差マイナス日数', 'B:差マイナス日数', '日数変化',
+                'A:平均安全在庫', 'B:平均安全在庫', '安全在庫変化率(%)',
+            ]
+            
+            display_df['A:平均安全在庫'] = display_df['A:平均安全在庫'].round(1)
+            display_df['B:平均安全在庫'] = display_df['B:平均安全在庫'].round(1)
+            
+            st.dataframe(
+                display_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    '日数変化': st.column_config.NumberColumn(
+                        '日数変化', format="%+d",
+                    ),
+                    '安全在庫変化率(%)': st.column_config.NumberColumn(
+                        '安全在庫変化率(%)', format="%+.1f%%",
+                    ),
+                }
+            )
+            
+            st.divider()
+            
+            # 個別原料の詳細比較
+            st.markdown("### 🎯 特定原料の詳細比較")
+            
+            material_options = sorted(merged['原料名'].dropna().unique().tolist())
+            sel_material = st.selectbox(
+                "比較したい原料を選択",
+                ['（選択してください）'] + material_options,
+                key='sim_material',
+            )
+            
+            if sel_material != '（選択してください）':
+                sel_jan = merged[merged['原料名'] == sel_material]['原料JAN'].iloc[0]
+                detail_a = df_plan[df_plan['原料JAN'] == sel_jan].copy()
+                detail_b = df_plan_sim[df_plan_sim['原料JAN'] == sel_jan].copy()
+                
+                if len(detail_a) > 0 and len(detail_b) > 0:
+                    # 日付ごとに横に並べる
+                    detail_a_p = detail_a.set_index('日付')[['入', '出', '残', '安全在庫', '差']].copy()
+                    detail_b_p = detail_b.set_index('日付')[['入', '出', '残', '安全在庫', '差']].copy()
+                    
+                    # 差分を計算
+                    detail_diff = detail_b_p - detail_a_p
+                    
+                    detail_a_p.columns = [f'{c}_A' for c in detail_a_p.columns]
+                    detail_b_p.columns = [f'{c}_B' for c in detail_b_p.columns]
+                    detail_diff.columns = [f'{c}_差分' for c in detail_diff.columns]
+                    
+                    combined = pd.concat([detail_a_p, detail_b_p, detail_diff], axis=1)
+                    combined = combined.reset_index()
+                    
+                    # 並び順を調整
+                    cols_order = ['日付']
+                    for item in ['入', '出', '残', '安全在庫', '差']:
+                        cols_order.extend([f'{item}_A', f'{item}_B', f'{item}_差分'])
+                    combined = combined[cols_order]
+                    
+                    # 数値を丸める
+                    for c in combined.columns:
+                        if c != '日付':
+                            combined[c] = combined[c].round(2)
+                    
+                    st.markdown(f"**{sel_material}** の日別比較")
+                    st.dataframe(combined, use_container_width=True, hide_index=True, height=400)
+
+
+# ========== タブ：棚卸カウント確認（2026-05-30 追加） ==========
+# 棚卸前に「見込み在庫数」を表示する予習画面。事後アラートではなく、事前の
+# メンタルモデル形成で現物カウントの精度を上げる設計思想。計算は新規作成せず
+# calculate_flow の日別入/出を期間集計して再利用する（compute_expected_inventory）。
+with tab_tana:
+    st.subheader("📝 棚卸カウント確認")
+    st.caption("棚卸前に「見込み在庫数」を確認し、現物カウントの目安にします（単位：パック）")
+
+    inv_tana = loaded['inventory'][loaded['inventory']['店舗名'] == selected_store]
+    inv_tana_dates = sorted(inv_tana['棚卸日_d'].dropna().unique(), reverse=True)
+
+    if len(inv_tana_dates) == 0:
+        st.warning(f"⚠️ {selected_store} の棚卸データがありません。")
+    else:
+        prev_tana_date = inv_tana_dates[0]  # 前回棚卸日 = 直近棚卸日（＝集計起点）
+
+        # 棚卸予定日の選択範囲：前回棚卸日の翌日 〜 計画最終日
+        plan_tana = loaded['plan'][loaded['plan']['店舗名'] == selected_store]
+        plan_max = plan_tana['日付_d'].dropna().max() if len(plan_tana) else None
+        min_sel = prev_tana_date + datetime.timedelta(days=1)
+        # 前回棚卸日の翌日以降に計画があるか。
+        # 例：粕屋CK は計画が5/24止まりなのに棚卸が5/31だと min_sel(6/1) > plan_max(5/24) になり、
+        # st.date_input が min_value>max_value で例外を投げる（2026/6/2 タスクEで顕在化）。
+        # 計画がない店舗は棚卸予定日を選べないので、ここで打ち切って警告だけ出す。
+        window_ok = (plan_max is not None) and (plan_max >= min_sel)
+        # 既定は「今日」（＝今夜カウントする想定日）。実績最終日(actual_max)は通常「昨日」のため、
+        # 既定を actual_max にすると今日開いても予定日が昨日になり予習にならない（2026/6/9 武田指摘）。
+        # 今日の製造は計画として下の target_date=actual_max 経由で反映される。範囲外はクランプ。
+        default_sel = datetime.date.today()
+        if plan_max is not None and default_sel > plan_max:
+            default_sel = plan_max
+        if default_sel < min_sel:
+            default_sel = min_sel
+
+        if not window_ok:
+            st.warning(
+                f"⚠️ {selected_store} は前回棚卸日（{prev_tana_date.strftime('%Y-%m-%d')}）の"
+                f"翌日以降の計画データがありません（計画最終日："
+                f"{plan_max.strftime('%Y-%m-%d') if plan_max is not None else 'なし'}）。"
+                "棚卸予定日を選べないため、見込み在庫数は表示できません。計画データを更新してください。"
+            )
+            tana_yotei = min_sel  # 形式上の値（下の見込み計算は window_ok=False でスキップ）
+        else:
+            col1, col2 = st.columns([1.2, 2])
+            with col1:
+                tana_yotei = st.date_input(
+                    "📅 棚卸予定日",
+                    value=default_sel,
+                    min_value=min_sel,
+                    max_value=plan_max,
+                    key='tana_yotei_date',
+                    help="この日に棚卸する想定で、前回棚卸からの動きを反映した見込み在庫数を出します",
+                )
+            with col2:
+                st.markdown(f"**📋 前回棚卸日**：{prev_tana_date.strftime('%Y-%m-%d')}")
+                st.caption(f"集計期間：{min_sel} 〜 {tana_yotei}")
+
+        period_start = prev_tana_date
+        period_end = tana_yotei
+
+        # 原料名・区分マップ（マスタ）
+        mat_df = loaded['material']
+        name_map = dict(zip(mat_df['原料JAN'].astype(str), mat_df['原料名']))
+        kubun_map = dict(zip(mat_df['原料JAN'].astype(str), mat_df['原料区分']))
+
+        def _tana_label(j):
+            nm = name_map.get(j, '')
+            return f"{nm}（{j}）" if nm else j
+
+        override_df = load_tanaoroshi_override()
+        base_jans = get_tanaoroshi_inventory_jans(selected_store, loaded, prev_tana_date)
+
+        # ---- 棚卸対象の調整（折りたたみ：補助機能のため畳む） ----
+        with st.expander("⚙️ 棚卸対象の調整（この店舗の例外設定）", expanded=False):
+            st.caption(
+                "デフォルトの棚卸対象は『直近の棚卸に登録されている原料』です。"
+                "ここで店舗別に追加・除外できます。"
+            )
+            cur_ov = override_df[override_df['店舗名'] == selected_store]
+            cur_add = set(cur_ov[cur_ov['種別'] == '追加']['原料JAN'].astype(str))
+            cur_rem = set(cur_ov[cur_ov['種別'] == '除外']['原料JAN'].astype(str))
+
+            all_jans = sorted(set(mat_df['原料JAN'].astype(str)) - {''})
+            add_candidates = [j for j in all_jans if j not in base_jans]
+            rem_candidates = sorted(base_jans)
+
+            sel_add = st.multiselect(
+                "➕ 追加する原料（棚卸対象に含める）",
+                add_candidates,
+                default=[j for j in cur_add if j in add_candidates],
+                format_func=_tana_label,
+                key='tana_add',
+            )
+            sel_rem = st.multiselect(
+                "➖ 除外する原料（棚卸対象から外す）",
+                rem_candidates,
+                default=[j for j in cur_rem if j in rem_candidates],
+                format_func=_tana_label,
+                key='tana_rem',
+            )
+            if st.button("💾 棚卸対象の調整を保存", key='save_tana_override'):
+                other = override_df[override_df['店舗名'] != selected_store]
+                new_rows = []
+                for j in sel_add:
+                    new_rows.append({'店舗名': selected_store, '原料JAN': j, '種別': '追加'})
+                for j in sel_rem:
+                    new_rows.append({'店舗名': selected_store, '原料JAN': j, '種別': '除外'})
+                merged_ov = (pd.concat([other, pd.DataFrame(new_rows)], ignore_index=True)
+                             if new_rows else other)
+                save_tanaoroshi_override(merged_ov)
+                st.success("保存しました。画面を更新します。")
+                st.rerun()
+
+        # ---- 最終対象セット ----
+        target_jans = get_tanaoroshi_targets_for_store(
+            selected_store, loaded, prev_tana_date, override_df
+        )
+        if not window_ok:
+            pass  # 計画データがないため見込み計算はスキップ（上で警告済み）
+        elif not target_jans:
+            st.warning("棚卸対象の原料がありません。")
+        else:
+            # ---- 見込み在庫数の計算（calculate_flow を再利用） ----
+            with st.spinner("見込み在庫数を計算中..."):
+                flow_tana = calculate_flow_cached(
+                    selected_store,
+                    # target_date は実績／計画の境界。棚卸予定日(period_end)ではなく実績最終日に固定する。
+                    # period_end を渡すと、棚卸予定日が実績最終日より先のとき その間の日を「実績扱い→空」で
+                    # 計上し、当日分の計画製造が無視される（見込み@予定日＝見込み@実績最終日になる）。
+                    # 実績最終日で固定すれば 〜実績最終日=実績、それ以降=計画 で延伸し、
+                    # 棚卸予定日(=今日)の製造終了後の見込みが正しく出る（2026/6/9 武田指摘）。
+                    target_date=actual_max,
+                    base_days=params['base_days'],
+                    yield_fusoku=params['yield_fusoku'],
+                    yield_kasoku=params['yield_kasoku'],
+                    adjustments={},  # 見込みは物理カウントの予習のため、ズレ補正は加えない
+                )
+
+            # 前回棚卸数（生の棚卸数。補正なし）
+            inv_open = inv_tana[inv_tana['棚卸日_d'] == prev_tana_date].copy()
+            inv_open['棚卸数_n'] = pd.to_numeric(inv_open['棚卸数'], errors='coerce').fillna(0.0)
+            jan_col = 'JAN' if 'JAN' in inv_open.columns else '原料JAN'
+            opening_dict = inv_open.groupby(jan_col)['棚卸数_n'].sum().to_dict()
+
+            recs = []
+            for j in target_jans:
+                vals = compute_expected_inventory(
+                    j, flow_tana, opening_dict, period_start, period_end
+                )
+                recs.append({
+                    '原料JAN': j,
+                    '原料名': name_map.get(j, '（マスタ未登録）'),
+                    '原料区分': kubun_map.get(j, ''),
+                    **vals,
+                })
+            df_tana = pd.DataFrame(recs)
+
+            base_count = len(base_jans)
+            final_count = len(target_jans)
+            added = len(set(target_jans) - base_jans)
+            removed = len(base_jans - set(target_jans))
+            st.markdown(
+                f"**棚卸対象：{final_count} 原料**"
+                f"（ベース {base_count} ＋追加 {added} −除外 {removed}）"
+            )
+            st.caption("※ 各数値はパック単位で四捨五入して表示しています")
+            st.markdown("---")
+
+            # 原料区分でグルーピングして表示（業務的並び順）
+            ordered_kubun = get_sorted_material_categories(mat_df, exclude_target_gai=False)
+            shown = set()
+            disp_cols = ['原料名', '前回棚卸数', '期間入数', '期間出数', '見込み在庫数']
+
+            def _render_tana_table(sub, scope_id):
+                d = sub[disp_cols].copy().sort_values('原料名')
+                for c in ['前回棚卸数', '期間入数', '期間出数', '見込み在庫数']:
+                    d[c] = d[c].round().astype(int)
+                d = d.rename(columns={'期間入数': '期間入数(＋)', '期間出数': '期間出数(−)'})
+                # タスクG-2：sticky HTML表（原料名固定・文字大・整数右寄せ）。
+                render_html_table(
+                    d, scope=f"htbl-tana-{scope_id}",
+                    pin_cols=['原料名'], pin_widths={'原料名': 240},
+                    max_height=520,
+                )
+
+            for _ki, kbn in enumerate(ordered_kubun):
+                sub = df_tana[df_tana['原料区分'] == kbn]
+                if len(sub) == 0:
+                    continue
+                shown.update(sub['原料JAN'])
+                st.markdown(f"#### {kbn}（{len(sub)}）")
+                _render_tana_table(sub, _ki)
+
+            rest = df_tana[~df_tana['原料JAN'].isin(shown)]
+            if len(rest) > 0:
+                st.markdown(f"#### その他・未分類（{len(rest)}）")
+                _render_tana_table(rest, 'rest')
+
+
+# ========== タブ6：棚卸評価（2026/5/14 追加） ==========
+# 棚卸結果と論理在庫の乖離を評価し、原料ごとに ◎○△× を付ける。
+# セクション構成：
+#   1) 詳細評価（在庫集計＋乖離評価×在庫分類クロス集計）
+#   2) 横断比較（店舗別の評価分布）
+#   3) 時系列推移（選択店舗の棚卸履歴）
+with tab6:
+    st.subheader("📊 棚卸評価")
+
+    # ---- 上部：棚卸日選択 / 店舗情報 / 前回棚卸日表示 ----
+    inv_for_store = loaded['inventory'][loaded['inventory']['店舗名'] == selected_store]
+    inv_dates = sorted(inv_for_store['棚卸日_d'].dropna().unique(), reverse=True)
+
+    if len(inv_dates) == 0:
+        st.warning(f"⚠️ {selected_store} の棚卸データがありません。")
+    else:
+        col_a, col_b, col_c = st.columns([1.5, 1.5, 2])
+        with col_a:
+            eval_target_date = st.selectbox(
+                "📅 評価対象の棚卸日",
+                inv_dates,
+                format_func=lambda d: d.strftime('%Y-%m-%d') if d else '',
+                key='eval_target_date',
+            )
+        with col_b:
+            st.markdown(f"**🏪 対象店舗**  \n{selected_store}")
+            st.caption("（上部の店舗カードで切替）")
+        with col_c:
+            prev_dates = [d for d in inv_dates if d < eval_target_date]
+            if prev_dates:
+                prev_date_show = max(prev_dates)
+                period_start = prev_date_show + datetime.timedelta(days=1)
+                st.markdown(f"**📋 前回棚卸日**  \n{prev_date_show.strftime('%Y-%m-%d')}")
+                st.caption(f"集計期間：{period_start} 〜 {eval_target_date}")
+            else:
+                st.markdown("**📋 前回棚卸日**  \n_なし_")
+                st.caption("論理在庫＝0 として表示（前回棚卸が必要）")
+
+        st.markdown("---")
+
+        # ---- 計算実行 ----
+        df_eval = calculate_inventory_evaluation(
+            selected_store, eval_target_date, loaded,
+            base_days=params['base_days'],
+            yield_fusoku=params['yield_fusoku'],
+            yield_kasoku=params['yield_kasoku'],
+        )
+
+        if len(df_eval) == 0:
+            st.warning("評価対象の原料がありません（マスタを確認してください）")
+        else:
+            # ====== セクション1：詳細評価 ======
+            st.markdown("### 📋 セクション1：今回棚卸の詳細評価")
+
+            # ---- 上段：A/B/C 3グループ階層表示（2026/5/15 / 2026/5/18 改定） ----
+            # A: 棚卸データ全体の規模感（論理＝評価対象の総数 / 実在庫 / 実在庫なし）
+            #    業務側「論理在庫」=評価対象の総数。差 = 実在庫 - 評価対象 = -実在庫なし件数
+            # B: 実在庫>0 のアイテムを「不動 / アクティブ」に分類（合計＝実在庫件数）
+            # C: アクティブ在庫の中身（過剰 / 不足、内訳の過剰α）
+            n_a_logical = len(df_eval)  # 評価対象の総数（2026/5/18 業務側ラベルに合わせて変更）
+            n_a_actual = int((df_eval['実在庫'] > 0).sum())
+            n_a_diff = n_a_actual - n_a_logical  # マイナスで「実在庫なし件数」に等しい
+            n_a_no_actual = int((df_eval['分類'] == '実在庫なし').sum())
+            # 真のカウント漏れ候補：論理在庫値>0（あるはず）かつ 実在庫=0（無い）
+            n_a_true_missing = int(((df_eval['論理在庫'] > 0) & (df_eval['実在庫'] <= 0)).sum())
+
+            # B：実在庫>0 のみが対象。 n_b_inactive + n_b_active == n_a_actual を保証
+            n_b_inactive = int((df_eval['分類'] == '不動').sum())
+            n_b_active = int(df_eval['分類'].isin(['過剰', '過剰α', '不足']).sum())
+
+            n_c_alpha = int((df_eval['分類'] == '過剰α').sum())
+            n_c_over = int(((df_eval['分類'] == '過剰') | (df_eval['分類'] == '過剰α')).sum())
+            n_c_short = int((df_eval['分類'] == '不足').sum())
+
+            # HTML/CSS でカード風レイアウト
+            def _row(label, value, indent=0, sub=None):
+                ind = indent * 18
+                sub_html = f'<span style="font-size:0.8em;color:#888;margin-left:6px;">{sub}</span>' if sub else ''
+                return f'''
+                <div style="display:flex;justify-content:space-between;align-items:baseline;
+                            padding:6px 0;padding-left:{ind}px;border-bottom:1px solid #f0f0f0;">
+                  <span style="color:#444;font-size:0.95em;">{label}{sub_html}</span>
+                  <span style="font-size:1.35em;font-weight:600;color:#222;">{value} <span style="font-size:0.65em;color:#888;font-weight:400;">件</span></span>
+                </div>
+                '''
+
+            def _card(title, color, rows_html):
+                return f'''
+                <div style="border:1px solid #ddd;border-left:4px solid {color};
+                            border-radius:6px;padding:14px 16px;background:#fcfcfc;height:100%;">
+                  <div style="font-weight:600;color:#333;margin-bottom:10px;font-size:0.95em;">{title}</div>
+                  {rows_html}
+                </div>
+                '''
+
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                rows = (
+                    _row("論理在庫", f"{n_a_logical}", sub="評価対象の総数")
+                    + _row("実在庫", f"{n_a_actual}", sub=f"差 {n_a_diff:+d}")
+                    + _row("実在庫なし", f"{n_a_no_actual}")
+                    + _row("うちカウント漏れ可能性", f"{n_a_true_missing}", indent=1,
+                           sub="論理値あり×棚卸0")
+                )
+                st.markdown(_card("🔍 A. 棚卸の規模感（カウント漏れ検出）", "#4a90e2", rows), unsafe_allow_html=True)
+            with col_b:
+                rows = _row("不動在庫", f"{n_b_inactive}", indent=1) + _row("アクティブ", f"{n_b_active}", indent=1)
+                st.markdown(_card("📊 B. 実棚アイテムの在庫分類", "#7cb342", rows), unsafe_allow_html=True)
+            with col_c:
+                rows = (_row("過剰", f"{n_c_over}", indent=2, sub=f"内 過剰α {n_c_alpha}")
+                        + _row("不足", f"{n_c_short}", indent=2))
+                st.markdown(_card("⚡ C. アクティブ在庫の実態", "#fb8c00", rows), unsafe_allow_html=True)
+
+            st.caption(
+                f"※ 評価対象は **棚卸データに登場した原料のみ**（前回または今回の棚卸でカウントあり）"
+                f"／対象区分=対象外 を除外、計 {len(df_eval)} 件"
+            )
+
+            st.markdown("---")
+
+            # ---- 下段：乖離評価 × 在庫分類 クロス集計 ----
+            st.markdown("### 🎯 乖離評価 × 在庫分類")
+
+            eval_order = ['◎', '○', '△', '×']
+            # 2026/5/18：'実在庫なし' を追加（A セクションの「実在庫なし」と整合）
+            class_order = ['不動', '過剰', '過剰α', '不足', '実在庫なし']
+
+            cross = pd.crosstab(df_eval['評価'], df_eval['分類'])
+            cross = cross.reindex(index=eval_order, columns=class_order, fill_value=0)
+            cross['合計'] = cross.sum(axis=1)
+            cross.loc['合計'] = cross.sum(axis=0)
+            cross = cross[['合計'] + class_order]
+
+            eval_labels = {
+                '◎': '◎ (±5)',
+                '○': '○ (±20)',
+                '△': '△ (±30)',
+                '×': '× (>30)',
+                '合計': '合計',
+            }
+            cross.index = [eval_labels.get(v, v) for v in cross.index]
+            cross.index.name = '評価'
+
+            st.dataframe(
+                cross,
+                use_container_width=True,
+                column_config={
+                    c: st.column_config.NumberColumn(c, format='%d', width=80)
+                    for c in cross.columns
+                },
+            )
+
+            st.caption(
+                "◎ ±5以内 / ○ ±20以内 / △ ±30以内 / × ±30超 ─ 行=評価、列=在庫分類、値=件数"
+            )
+
+
+# ========== タブ7：原料ピックアップ（2026/5/15 実装） ==========
+# 棚卸評価タブで集計された ◎○△× × 在庫分類に対して、
+# 具体的にどの原料が該当するかを一覧で確認するタブ。
+# 棚卸評価タブと同じ「店舗 × 棚卸日」を参照する（連動表示）。
+with tab7:
+    st.subheader("🔍 原料ピックアップ")
+
+    # ---- 連動元（棚卸評価タブ）の選択を参照 ----
+    # 将来「独立させたい」要望が出た場合は、ここを selectbox に切り替えればよい
+    pickup_store = selected_store
+    pickup_target_date = st.session_state.get('eval_target_date')
+
+    pickup_inv_for_store = loaded['inventory'][loaded['inventory']['店舗名'] == pickup_store]
+    pickup_inv_dates = sorted(pickup_inv_for_store['棚卸日_d'].dropna().unique(), reverse=True)
+
+    if len(pickup_inv_dates) == 0:
+        st.warning(f"⚠️ {pickup_store} の棚卸データがありません。")
+    else:
+        # eval_target_date が未設定 or 不一致なら最新日にフォールバック
+        if pickup_target_date is None or pickup_target_date not in pickup_inv_dates:
+            pickup_target_date = pickup_inv_dates[0]
+
+        # ---- 上部UI ----
+        col_a, col_b, col_c = st.columns([1.5, 1.5, 2.5])
+        with col_a:
+            st.markdown(f"**🏪 店舗**  \n{pickup_store}")
+        with col_b:
+            st.markdown(f"**📅 棚卸日**  \n{pickup_target_date.strftime('%Y-%m-%d')}")
+        with col_c:
+            st.caption(
+                "📊 棚卸評価タブと同じ店舗・棚卸日を表示中。"
+                "店舗は上部の店舗カードで、棚卸日は『棚卸評価』タブで変更できます。"
+            )
+
+        # ---- 計算実行（棚卸評価タブと同じ関数） ----
+        df_pickup = calculate_inventory_evaluation(
+            pickup_store, pickup_target_date, loaded,
+            base_days=params['base_days'],
+            yield_fusoku=params['yield_fusoku'],
+            yield_kasoku=params['yield_kasoku'],
+        )
+
+        if len(df_pickup) == 0:
+            st.warning("評価対象の原料がありません（棚卸データを確認してください）")
+        else:
+            st.markdown("---")
+
+            # ---- フィルタ ----
+            eval_all = ['◎', '○', '△', '×']
+            class_all = ['不動', '過剰', '過剰α', '不足', '実在庫なし']
+
+            # クイックボタン（全選択 / 全解除）
+            bcol1, bcol2, _ = st.columns([1, 1, 4])
+            if bcol1.button("☑️ すべて選択", key='pickup_select_all', use_container_width=True):
+                for v in eval_all:
+                    st.session_state[f'pickup_eval_{v}'] = True
+                for v in class_all:
+                    st.session_state[f'pickup_class_{v}'] = True
+                st.rerun()
+            if bcol2.button("☐ すべて解除", key='pickup_clear_all', use_container_width=True):
+                for v in eval_all:
+                    st.session_state[f'pickup_eval_{v}'] = False
+                for v in class_all:
+                    st.session_state[f'pickup_class_{v}'] = False
+                st.rerun()
+
+            # 評価チェックボックス（横並び4つ）
+            st.markdown("**評価フィルタ**")
+            ec1, ec2, ec3, ec4 = st.columns(4)
+            sel_eval = []
+            for v, col in zip(eval_all, [ec1, ec2, ec3, ec4]):
+                # デフォルト全選択（初回のみ true）
+                key = f'pickup_eval_{v}'
+                if key not in st.session_state:
+                    st.session_state[key] = True
+                if col.checkbox(v, key=key):
+                    sel_eval.append(v)
+
+            # 分類チェックボックス（横並び4つ）
+            st.markdown("**分類フィルタ**")
+            cc1, cc2, cc3, cc4, cc5 = st.columns(5)
+            sel_class = []
+            for v, col in zip(class_all, [cc1, cc2, cc3, cc4, cc5]):
+                key = f'pickup_class_{v}'
+                if key not in st.session_state:
+                    st.session_state[key] = True
+                if col.checkbox(v, key=key):
+                    sel_class.append(v)
+
+            # ---- フィルタ適用 ----
+            df_filtered = df_pickup[
+                df_pickup['評価'].isin(sel_eval) & df_pickup['分類'].isin(sel_class)
+            ].reset_index(drop=True)
+
+            # ---- 件数表示 ----
+            st.markdown(
+                f"### 🎯 絞り込み結果：**{len(df_filtered)} 件** / 全 {len(df_pickup)} 件"
+            )
+
+            if len(df_filtered) == 0:
+                st.info("条件に該当する原料はありません。フィルタを見直してください。")
+            else:
+                # ---- 表示用 DataFrame（列順を整理。原料名を先頭にして固定列に） ----
+                show_cols = [
+                    '原料名', '原料JAN', '原料区分', '対象区分',
+                    '前回棚卸日', '前回棚卸数', '納品数', '使用量',
+                    '論理在庫', '実在庫', '差', '|差|',
+                    '評価', '分類', '1日使用量', '安全在庫',
+                ]
+                show_cols = [c for c in show_cols if c in df_filtered.columns]
+                df_show = df_filtered[show_cols]
+
+                # タスクG-2：sticky HTML表へ置換（原料名固定・文字大・差/評価を色強調）
+                def _eval_cell_cls(col, v):
+                    if col == '差' and isinstance(v, (int, float, np.integer, np.floating)) and not pd.isna(v):
+                        return 'neg' if v < 0 else ''
+                    if col == '評価':
+                        if v == '×':
+                            return 'neg'
+                        if v == '◎':
+                            return 'pos'
+                    return ''
+
+                render_html_table(
+                    df_show,
+                    scope="htbl-eval",
+                    pin_cols=['原料名'],
+                    pin_widths={'原料名': 220},
+                    col_labels={
+                        '前回棚卸数': '前回棚卸', '納品数': '納品', '論理在庫': '論理',
+                        '実在庫': '実', '対象区分': '対象', '1日使用量': '1日使用',
+                    },
+                    col_formats={
+                        '前回棚卸数': '%.1f', '納品数': '%.1f', '使用量': '%.1f',
+                        '論理在庫': '%.1f', '実在庫': '%.1f', '差': '%+.1f', '|差|': '%.1f',
+                        '1日使用量': '%.2f', '安全在庫': '%.1f',
+                    },
+                    col_align={
+                        '原料JAN': 'left', '原料区分': 'left', '対象区分': 'center',
+                        '前回棚卸日': 'center', '評価': 'center', '分類': 'center',
+                    },
+                    cell_class_func=_eval_cell_cls,
+                    max_height=700,
+                )
+                st.caption("💡 原料名は左端固定・見出しは上端固定（横/縦スクロールしても消えません）。差マイナスと評価×は赤強調。")
+
+                # ---- CSV ダウンロード ----
+                import io as _io
+                csv_buf = _io.StringIO()
+                df_show.to_csv(csv_buf, index=False, encoding='utf-8-sig')
+                ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+                fname = f"棚卸評価_{pickup_store}_{pickup_target_date.strftime('%Y%m%d')}_{ts}.csv"
+                st.download_button(
+                    label="📥 絞り込み結果を CSV でダウンロード",
+                    data=csv_buf.getvalue().encode('utf-8-sig'),
+                    file_name=fname,
+                    mime='text/csv',
+                )
+
+
+# ========== タブ8：📦 エリア在庫（2026/5/18 追加） ==========
+# エリア（店舗グルーピング）内の店舗を横断して、特定原料の在庫状況を確認し
+# 移動候補を提示するタブ。
+# 構成：
+#   上部UI（エリア・原料・基準日選択）         ← Phase 3B
+#   メイン表（店舗×日付、論理在庫＋予測在庫）  ← Phase 3C
+#   サジェスト（過剰→不足の移動候補）          ← Phase 3D
+with tab8:
+    st.subheader("📦 エリア在庫")
+    st.caption(
+        "※ 在庫推移は『計画通りに進んだ場合の予測値』です。"
+        "📉計画推移・📋実績推移と同じ計算ロジックを使用。"
+        "棚卸評価タブの『論理在庫』とは目的が異なるため、数字が違うことがあります。"
+    )
+
+    # ---- 店舗グルーピング設定の取得 ----
+    area_groups_data = load_store_groups()
+    area_groups = area_groups_data.get('groups', [])
+
+    if not area_groups:
+        st.warning(
+            "⚠️ 店舗グルーピングが未設定です。"
+            "**⚙️設定タブ** で店舗グルーピングを設定してください。"
+        )
+    else:
+        # ---- 上部UI（2026/5/19 改定）：3段構造 ----
+        # 1段目：エリア（selectbox）／ 基準日（date_input）
+        # 2段目：原料区分（ボタン群、画面幅で折り返し）
+        # 3段目：原料（ボタン群、画面幅で折り返し）
+        # selectbox のポップアップで画面占領しないよう、タグ風ボタンに変更
+
+        # material から対象区分=対象外を除外、区分ごとに整理
+        mat_df = loaded['material'].copy()
+        mat_df['原料JAN'] = mat_df['原料JAN'].astype(str).str.strip()
+        if '対象区分' in mat_df.columns:
+            mat_df = mat_df[mat_df['対象区分'] != '対象外'].copy()
+        mat_df = mat_df.drop_duplicates('原料JAN').reset_index(drop=True)
+        mat_df['原料No_int'] = pd.to_numeric(mat_df.get('原料No'), errors='coerce')
+
+        # 業務的並び順の原料区分リスト（共通関数）
+        sorted_kubuns = get_sorted_material_categories(loaded['material'], exclude_target_gai=True)
+        kubuns_with_items = [k for k in sorted_kubuns if (mat_df['原料区分'] == k).any()]
+
+        # --- 1段目：エリア / 基準日 ---
+        col_area, col_date = st.columns([2.5, 1.0])
+        with col_area:
+            area_names = [g['name'] for g in area_groups]
+            sel_area_name = st.selectbox(
+                "🏘️ エリア",
+                area_names,
+                key='area_inv_area',
+                help="⚙️設定タブの『店舗グルーピング』で設定したエリアから選択",
+            )
+            sel_area = next((g for g in area_groups if g['name'] == sel_area_name), None)
+            area_stores = sel_area.get('stores', []) if sel_area else []
+            st.caption(f"{len(area_stores)}店舗：{', '.join(area_stores) if area_stores else '所属なし'}")
+        with col_date:
+            today = datetime.date.today()
+            inv_dates = loaded['inventory']['棚卸日_d'].dropna()
+            plan_dates = loaded['plan']['日付_d'].dropna() if 'plan' in loaded else pd.Series([], dtype='object')
+            min_date = inv_dates.min() if len(inv_dates) > 0 else today - datetime.timedelta(days=30)
+            max_date = plan_dates.max() if len(plan_dates) > 0 else today + datetime.timedelta(days=30)
+            default_date = today if min_date <= today <= max_date else max_date
+            sel_base_date = st.date_input(
+                "📅 基準日",
+                value=default_date,
+                min_value=min_date,
+                max_value=max_date,
+                key='area_inv_base_date',
+                help="この日を起点に、当日〜+4日の在庫推移と1日使用量を計算",
+            )
+
+        # --- 2段目：原料区分（ボタン群、画面幅で折り返し） ---
+        # session_state を初期化（初回 or 値が消えた場合）
+        if 'area_inv_kubun' not in st.session_state or st.session_state['area_inv_kubun'] not in kubuns_with_items:
+            st.session_state['area_inv_kubun'] = kubuns_with_items[0] if kubuns_with_items else None
+        # ボタン群（21個）の DOM 描画が重かったため radio に変更（DOMノード1個）。
+        sel_kubun = st.radio(
+            "🏷️ 原料区分",
+            kubuns_with_items,
+            horizontal=True,
+            key='area_inv_kubun',
+            help="業務的並び順（ご飯・サーモン・マグロ…包材末尾）。タップで切替",
+        )
+
+        # --- 3段目：原料（selectbox、区分内の原料、原料No順、2026/5/19 ハイブリッド案A'） ---
+        mat_in_kubun = mat_df[mat_df['原料区分'] == sel_kubun].sort_values(
+            ['原料No_int', '原料名'], na_position='last'
+        ).reset_index(drop=True)
+        mat_options = list(mat_in_kubun['原料JAN'])
+        mat_labels = {row['原料JAN']: row['原料名'] for _, row in mat_in_kubun.iterrows()}
+
+        # ---- 関連グループ N>=2 のラベル末尾に「 [関連N件]」を付与（2026/5/20）----
+        # CD違い同一原料の手動グループ定義（data/material_groups.csv）に基づき、
+        # radio 表示だけを書き換える。選択値（mat_options = 原料JAN）はそのまま、
+        # 既存 mat_labels も純粋な原料名のまま保持（タイトル等の他参照を壊さない）。
+        # キャッシュ取得を区分内件数ぶん繰り返さないよう、groups_df は1度だけ取得。
+        _mg_df = load_material_groups()
+        mat_labels_radio = {}
+        for _j in mat_options:
+            _base = mat_labels.get(_j, _j)
+            _related = get_related_material_cds(_j, groups_df=_mg_df)
+            if len(_related) >= 2:
+                mat_labels_radio[_j] = f"{_base} [関連{len(_related)}件]"
+            else:
+                mat_labels_radio[_j] = _base
+
+        # 区分変更時に「現在選択中の原料」が新区分に含まれない場合、先頭にリセット
+        if 'area_inv_material' not in st.session_state or st.session_state['area_inv_material'] not in mat_options:
+            st.session_state['area_inv_material'] = mat_options[0] if mat_options else None
+        # radio に統一（2026/5/19）：selectbox はタブレットでソフトキーボードが出てしまうため。
+        # radio は DOM ノード1個なので、159件あっても描画は軽い（包材系の縦スクロールで対応）。
+        sel_material_jan = st.radio(
+            f"📦 原料（区分内 {len(mat_options)} 件）",
+            mat_options,
+            format_func=lambda j: mat_labels_radio.get(j, mat_labels.get(j, j)),
+            key='area_inv_material',
+            help="区分内の原料から選択（タップで切替、159件の場合は縦スクロール）",
+        )
+
+        st.markdown("---")
+
+        # ---- メイン表：エリア内 9 店舗 × 基準日±4日 の在庫推移 ----
+        if not area_stores:
+            st.warning("このエリアには店舗が割り当てられていません。⚙️設定タブで設定してください。")
+        else:
+            with st.spinner(f"{len(area_stores)} 店舗の在庫推移を計算中..."):
+                df_area = get_area_inventory_data(
+                    area_stores,
+                    sel_material_jan,
+                    sel_base_date,
+                    base_days=params['base_days'],
+                    yield_fusoku=params['yield_fusoku'],
+                    yield_kasoku=params['yield_kasoku'],
+                    target_date=params['target_date'],
+                )
+
+            # 余裕日数の少ない順（昇順）、NaN は最下部
+            # → 危険な店舗が上に来て移動検討のフォーカスがしやすい
+            df_area = df_area.sort_values(
+                '余裕日数', ascending=True, na_position='last'
+            ).reset_index(drop=True)
+
+            st.markdown(
+                f"### 📊 在庫推移：**{mat_labels.get(sel_material_jan, '')}** "
+                f"<span style='color:#888;font-size:0.7em'>"
+                f"／ {sel_area_name}（{len(area_stores)}店舗）／ 基準日 {sel_base_date}</span>",
+                unsafe_allow_html=True,
+            )
+
+            st.dataframe(
+                df_area,
+                use_container_width=True,
+                hide_index=True,
+                height=min(560, 60 + len(df_area) * 38),
+                column_config={
+                    '店舗': st.column_config.TextColumn('店舗', width=140, pinned=True),
+                    '最新棚卸日': st.column_config.DateColumn('最新棚卸日', width=110),
+                    '実棚卸数': st.column_config.NumberColumn('実棚卸', format='%.1f', width=80),
+                    '論理在庫': st.column_config.NumberColumn(
+                        '論理在庫（基準日）', format='%.1f', width=120,
+                        help='基準日時点の在庫予測値（calculate_flow と同じ）',
+                    ),
+                    '当日': st.column_config.NumberColumn('当日', format='%.1f', width=80),
+                    '+1日': st.column_config.NumberColumn('+1日', format='%.1f', width=70),
+                    '+2日': st.column_config.NumberColumn('+2日', format='%.1f', width=70),
+                    '+3日': st.column_config.NumberColumn('+3日', format='%.1f', width=70),
+                    '+4日': st.column_config.NumberColumn('+4日', format='%.1f', width=70),
+                    '1日使用量': st.column_config.NumberColumn('1日使用', format='%.2f', width=80),
+                    '余裕日数': st.column_config.NumberColumn(
+                        '余裕日数', format='%.1f日', width=90,
+                        help='基準日の論理在庫 ÷ 1日使用量（⓪余裕日数 と同じ）',
+                    ),
+                    'ステータス': st.column_config.TextColumn('ステータス', width=130),
+                },
+            )
+
+            st.caption(
+                "💡 列ヘッダクリックでソート可能。"
+                "「当日」と「論理在庫」は同じ値（基準日の在庫予測）。"
+            )
+
+            # ---- 簡易サマリー ----
+            st.markdown("---")
+            st.markdown("### 📋 エリアサマリー")
+
+            n_danger = int((df_area['ステータス'] == '🚨 危険').sum())
+            n_caution = int((df_area['ステータス'] == '⚠️ 注意').sum())
+            n_safe = int((df_area['ステータス'] == '✅ 安全').sum())
+            n_no_use = int((df_area['ステータス'] == '— 使用予定なし').sum())
+
+            logical_sum = df_area['論理在庫'].dropna().sum()
+            inv_sum = df_area['実棚卸数'].dropna().sum()
+
+            sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+            sc1.metric('エリア合計（論理在庫）', f'{logical_sum:,.1f}')
+            sc2.metric('🚨 危険（不足候補）', f'{n_danger} 店舗')
+            sc3.metric('⚠️ 注意', f'{n_caution} 店舗')
+            sc4.metric('✅ 安全', f'{n_safe} 店舗', help='余裕日数 > 4日。過剰候補としてサジェスト対象')
+            sc5.metric('— 使用予定なし', f'{n_no_use} 店舗')
+
+            if n_danger > 0 and n_safe > 0:
+                st.info(
+                    f"💡 危険な店舗 **{n_danger}** 件、過剰候補（安全）**{n_safe}** 件あります。"
+                    "**フェーズ3D** で具体的な移動候補ペアと推奨移動量をサジェストする予定です。"
+                )
+            elif n_danger > 0:
+                st.warning(
+                    f"⚠️ 危険な店舗が **{n_danger}** 件あります。"
+                    "ただし同エリア内に過剰候補（安全）がないため、エリア内移動では解決できません。発注検討が必要。"
+                )
+            elif n_safe == len(df_area):
+                st.success("✅ エリア内のすべての店舗が安全域です。")
+
+            # ---- サジェスト：過剰候補 → 不足候補 の移動候補（Phase 3D）----
+            st.markdown("---")
+            st.markdown(f"### 💡 移動候補サジェスト")
+            st.caption(
+                f"目標：両店舗の余裕日数を {TARGET_MARGIN_DAYS} 日に近づける。"
+                "対象は **🚨 危険（余裕<2日）→ ✅ 安全（余裕>4日）** のみ。"
+                "⚠️ 注意（2-4日）と「— 使用予定なし」は対象外。"
+            )
+
+            sg_df, sg_info, sg_unfulfilled = calculate_move_suggestions(df_area)
+
+            if sg_info:
+                # 不足候補なし or 過剰候補なし or 余剰不足
+                if '✅' in sg_info:
+                    st.success(sg_info)
+                else:
+                    st.warning(sg_info)
+            elif len(sg_df) == 0:
+                st.info("提案できる移動候補がありません。")
+            else:
+                st.dataframe(
+                    sg_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        '移動元': st.column_config.TextColumn('移動元', width=140),
+                        '元 余裕（前→後）': st.column_config.TextColumn('元 余裕（前→後）', width=160),
+                        '推奨移動量': st.column_config.NumberColumn(
+                            '推奨移動量', format='%.1f', width=110,
+                            help='移動元の余剰を移動先に分配する量。両者の余裕日数が目標に近づく',
+                        ),
+                        '移動先': st.column_config.TextColumn('移動先', width=140),
+                        '先 余裕（前→後）': st.column_config.TextColumn('先 余裕（前→後）', width=160),
+                    },
+                )
+                st.caption(
+                    "💡 1行 = 1ペアの移動提案。"
+                    "「前→後」は移動を実行した場合の余裕日数の変化（推定値）。"
+                    "あくまで参考。最終判断は人間が行ってください。"
+                )
+
+            if sg_unfulfilled:
+                st.warning(sg_unfulfilled)
+
+
+# ========== タブ9：設定（管理対象原料の絞り込み） ==========
+# 「管理する原料」を画面上で選択し、保存できるタブ。
+# 設定ファイルに書き出され、次回起動時から全タブで適用される。
+#
+# 仕様：
+# - 全原料一覧から、管理対象にしたい原料を multiselect で選択
+# - 「全店舗共通」「この店舗のみ」を選んで保存
+# - 「フィルタ解除」で設定ファイル削除（=全原料表示に戻る）
+# - 原料区分・対象区分での一括選択ヘルパー
+with tab9:
+    st.subheader("⚙️ 設定")
+    
+    # 現在の編集対象店舗を明示
+    st.markdown(f"""
+    <div style='
+        background: #e3f2fd;
+        border-left: 4px solid #1565c0;
+        padding: 8px 14px;
+        border-radius: 4px;
+        margin-bottom: 14px;
+        font-size: 0.95rem;
+    '>
+        🏪 編集対象店舗：<b>{selected_store}</b>
+        <span style='font-size: 0.85rem; color: #555;'>　（店舗を切り替えるには上部のボタンから）</span>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # ============================================================
+    # チューニング設定（店舗ごと）
+    # ============================================================
+    st.markdown("### 🎚️ チューニング設定")
+    st.caption("コントローラーが現場の実態に合わせて調整するパラメータ。店舗ごとに設定できます。")
+    
+    cols2 = st.columns(4)
+    with cols2[0]:
+        params['base_days'] = st.number_input(
+            "安全在庫の基準日数",
+            min_value=1, max_value=14,
+            value=params['base_days'], step=1,
+            help="安全在庫を計算するときに「何日分の使用量を確保するか」",
+        )
+    with cols2[1]:
+        params['yield_fusoku'] = st.number_input(
+            "歩留(不測)",
+            min_value=0.1, max_value=1.0,
+            value=params['yield_fusoku'], step=0.05, format="%.2f",
+            help="ロスが計量できない原料の歩留率",
+        )
+    with cols2[2]:
+        params['yield_kasoku'] = st.number_input(
+            "歩留(可測)",
+            min_value=0.1, max_value=1.0,
+            value=params['yield_kasoku'], step=0.05, format="%.2f",
+            help="ロスが計量できる原料の歩留率",
+        )
+    with cols2[3]:
+        params['target_date'] = st.date_input(
+            "実績指定日",
+            value=params['target_date'],
+            min_value=actual_min,
+            max_value=actual_max,
+            help="この日まで実績、それ以降は計画で再計算",
+        )
+    
+    st.session_state.store_params[selected_store] = params
+    st.caption("💡 値を変更すると自動的に全タブの計算に反映されます")
+    
+    st.divider()
+    
+    # ============================================================
+    # 管理対象原料の絞り込み
+    # ============================================================
+    st.markdown("### 🎯 管理対象原料の絞り込み")
+    st.caption(
+        "現場で実際に管理している原料だけに絞り込んで表示します。"
+        "サマリー・在庫推移・ズレ補正など全タブに適用されます。"
+    )
+    
+    # 現在の設定状況を表示
+    current_cfg = load_managed_jans(selected_store)
+    if current_cfg and current_cfg.get('jans'):
+        scope_label = current_cfg.get('store', '共通')
+        n_now = len(current_cfg['jans'])
+        st.success(
+            f"✅ 現在の設定:**{n_now}原料**を管理対象としています(適用範囲:{scope_label})"
+        )
+    else:
+        st.info("ℹ️ 現在は**全原料**を表示しています(フィルタなし)")
+    
+    # ---- 全原料一覧を取得 ----
+    if 'material' in loaded:
+        mat_df_all = loaded['material'].copy()
+        mat_df_all['原料JAN'] = mat_df_all['原料JAN'].astype(str).str.strip()
+        mat_df_all['原料名'] = mat_df_all['原料名'].astype(str).str.strip()
+    else:
+        st.warning("原料マスタが読み込まれていません")
+        mat_df_all = pd.DataFrame()
+    
+    if len(mat_df_all) > 0:
+        # ---- 対象区分=「対象外」を自動除外 ----
+        n_taishogai = (mat_df_all['対象区分'] == '対象外').sum()
+        mat_df = mat_df_all[mat_df_all['対象区分'] != '対象外'].copy()
+        
+        st.warning(
+            f"🚫 **「対象区分=対象外」の {n_taishogai} 原料は候補から除外中**"
+            f"(管理対象として保存できません。残り候補:{len(mat_df)} 原料)"
+        )
+        
+        st.divider()
+        
+        # ============================================================
+        # ① 一括選択ヘルパー(原料区分を複数選択)
+        # ============================================================
+        st.markdown("### ① 一括選択ヘルパー")
+        st.caption("原料区分を複数選んで「該当原料を全選択」を押すと、② に反映されます")
+        
+        kbn_choices = sorted(mat_df['原料区分'].dropna().unique().tolist())
+        
+        hcol1, hcol2 = st.columns([3, 1])
+        with hcol1:
+            sel_kbns = st.multiselect(
+                "原料区分(複数選択可)",
+                options=kbn_choices,
+                key='_helper_kbns',
+                placeholder="原料区分を選択してください",
+            )
+        with hcol2:
+            st.write("")
+            st.write("")
+            apply_helper = st.button(
+                "✅ 該当原料を全選択", 
+                use_container_width=True,
+                disabled=(len(sel_kbns) == 0),
+                type='primary' if len(sel_kbns) > 0 else 'secondary',
+            )
+        
+        if sel_kbns:
+            candidate = mat_df[mat_df['原料区分'].isin(sel_kbns)].copy()
+            st.caption(f"📋 該当:**{len(candidate)} 原料**(選択中の原料区分:{', '.join(sel_kbns)})")
+        else:
+            candidate = pd.DataFrame()
+            st.caption("⬆ 原料区分を選択してください")
+        
+        if 'managed_select' not in st.session_state:
+            if current_cfg and current_cfg.get('jans'):
+                st.session_state.managed_select = list(current_cfg['jans'])
+            else:
+                st.session_state.managed_select = []
+        
+        if apply_helper and len(candidate) > 0:
+            st.session_state.managed_select = candidate['原料JAN'].tolist()
+            st.rerun()
+        
+        st.divider()
+        
+        # ============================================================
+        # ② 保存対象の確認・編集(テーブル形式)
+        # ============================================================
+        st.markdown("### ② 保存対象の確認・編集")
+        st.caption("チェックを外すと、その原料は管理対象から除外されます。")
+        
+        confirmed_jans = list(st.session_state.managed_select)
+        
+        if len(st.session_state.managed_select) == 0:
+            st.info("⬆ ①で「該当原料を全選択」を押してください。または個別に追加することもできます。")
+            
+            st.markdown("**個別に追加:**")
+            jan_to_label = {
+                r['原料JAN']: f"{r['原料名']}({r['原料JAN']})"
+                for _, r in mat_df.iterrows()
+            }
+            label_to_jan = {v: k for k, v in jan_to_label.items()}
+            
+            picked = st.multiselect(
+                "原料を選んで追加",
+                options=list(jan_to_label.values()),
+                default=[],
+                placeholder="原料名やJANで検索",
+            )
+            if picked:
+                st.session_state.managed_select = [label_to_jan[l] for l in picked]
+                st.rerun()
+        else:
+            selected_set = set(st.session_state.managed_select)
+            disp_df = mat_df[mat_df['原料JAN'].isin(selected_set)].copy()
+            disp_df = disp_df.sort_values(['原料区分', '原料名']).reset_index(drop=True)
+            disp_df.insert(0, '管理対象', True)
+            
+            st.caption(
+                f"📊 現在の保存対象:**{len(disp_df)} 原料**　"
+                f"(チェックを外して保存ボタンを押すと、その原料は除外されます)"
+            )
+            
+            edited = st.data_editor(
+                disp_df[['管理対象', '原料名', '原料JAN', '原料区分', '対象区分']],
+                use_container_width=True,
+                hide_index=True,
+                disabled=['原料名', '原料JAN', '原料区分', '対象区分'],
+                column_config={
+                    '管理対象': st.column_config.CheckboxColumn(
+                        '管理対象', help="チェックを外すと除外", default=True, width='small'
+                    ),
+                    '原料名': st.column_config.TextColumn('原料名', width='medium'),
+                    '原料JAN': st.column_config.TextColumn('JAN', width='small'),
+                    '原料区分': st.column_config.TextColumn('原料区分', width='small'),
+                    '対象区分': st.column_config.TextColumn('対象区分', width='small'),
+                },
+                key='_managed_editor',
+                height=min(500, 50 + len(disp_df) * 35),
+            )
+            
+            confirmed_jans = edited[edited['管理対象'] == True]['原料JAN'].tolist()
+            n_excluded = len(disp_df) - len(confirmed_jans)
+            
+            if n_excluded > 0:
+                st.caption(f"➖ {n_excluded} 原料のチェックを外しています(保存時に反映)")
+            
+            with st.expander("➕ 原料を個別に追加する", expanded=False):
+                jan_to_label = {
+                    r['原料JAN']: f"{r['原料名']}({r['原料JAN']})"
+                    for _, r in mat_df.iterrows()
+                    if r['原料JAN'] not in selected_set
+                }
+                add_picked = st.multiselect(
+                    "現在の選択にない原料を追加",
+                    options=list(jan_to_label.values()),
+                    default=[],
+                    placeholder="原料名やJANで検索",
+                    key='_add_picker',
+                )
+                if st.button("➕ 上記を追加", disabled=(len(add_picked) == 0)):
+                    label_to_jan = {v: k for k, v in jan_to_label.items()}
+                    new_jans = [label_to_jan[l] for l in add_picked]
+                    st.session_state.managed_select = list(
+                        set(st.session_state.managed_select + new_jans)
+                    )
+                    st.rerun()
+            
+            ccol1, _ccol2 = st.columns([1, 4])
+            with ccol1:
+                if st.button("🗑️ 選択を全部クリア", use_container_width=True):
+                    st.session_state.managed_select = []
+                    st.rerun()
+        
+        st.divider()
+        
+        # ============================================================
+        # ③ 保存
+        # ============================================================
+        st.markdown("### ③ 保存")
+        
+        scol1, scol2 = st.columns(2)
+        with scol1:
+            description = st.text_input(
+                "メモ(任意)",
+                placeholder="例:4月の重点管理原料",
+                help="この設定の用途を残しておくと後で見返しやすい",
+            )
+        with scol2:
+            scope_choice = st.radio(
+                "適用範囲",
+                ['全店舗共通', f'この店舗のみ({selected_store})'],
+                help="店舗ごとに違う原料を管理する場合は「この店舗のみ」を選択",
+            )
+        
+        save_target = confirmed_jans
+        
+        save_col1, save_col2, _save_col3 = st.columns([1, 1, 2])
+        with save_col1:
+            if st.button("💾 保存", type='primary', use_container_width=True):
+                if len(save_target) == 0:
+                    st.warning("⚠️ 1つも選択されていません。")
+                else:
+                    target_store = None if scope_choice == '全店舗共通' else selected_store
+                    ok = save_managed_jans(
+                        save_target,
+                        store=target_store,
+                        description=description,
+                    )
+                    if ok:
+                        st.session_state.managed_select = list(save_target)
+                        st.success(f"✅ 保存しました({len(save_target)} 原料)")
+                        st.rerun()
+        
+        with save_col2:
+            if st.button("🚫 フィルタを解除", use_container_width=True,
+                         help="設定ファイルを削除して全原料表示に戻す"):
+                d1 = delete_managed_jans(None)
+                d2 = delete_managed_jans(selected_store)
+                if d1 or d2:
+                    st.session_state.managed_select = []
+                    st.success("✅ フィルタを解除しました")
+                    st.rerun()
+                else:
+                    st.info("解除する設定ファイルがありませんでした")
+        
+        st.caption(
+            "💡 「全店舗共通」と「この店舗のみ」の両方が保存されている場合、"
+            "**店舗別の設定が優先**されます。"
+        )
+    
+    # ---- 設定ファイルの直接管理 ----
+    st.divider()
+    with st.expander("📂 設定ファイルの場所(上級者向け)", expanded=False):
+        st.code(f"""
+共通設定: {get_managed_jans_path(None)}
+店舗別 ({selected_store}): {get_managed_jans_path(selected_store)}
+        """.strip())
+        st.caption(
+            "設定はJSONファイルとして保存されます。"
+            "テキストエディタで直接編集することも可能です。"
+        )
+
+    # ============================================================
+    # 🏘️ 店舗グルーピング設定（2026/5/18 追加）
+    # ============================================================
+    # CLAUDE.md §5.1.5「店舗スコープと将来拡張への備え」の具体化。
+    # 店舗を業務単位（エリア・地域・カテゴリ）でグルーピングし、
+    # 📦 エリア在庫タブで「同じエリア内の在庫を横断的に見る」ために使う。
+    st.markdown("---")
+    st.markdown("### 🏘️ 店舗グルーピング設定")
+    st.caption(
+        "店舗を業務単位（エリア・地域・カテゴリなど）でグルーピング。"
+        "📦 エリア在庫タブで「同じエリア内の在庫を横断的に見る」ために使用します。"
+    )
+
+    groups_data = load_store_groups()
+    current_groups = groups_data.get('groups', [])
+    store_to_group = get_store_to_group_map(groups_data)
+
+    all_stores = sorted(st.session_state.stores)
+    # 未登録店舗（過去にあったが今はないなど）も保護のため含める
+    stores_to_show = sorted(set(all_stores) | set(store_to_group.keys()))
+
+    if current_groups:
+        st.markdown('**📋 現在のグルーピング**')
+        for g in current_groups:
+            members = g.get('stores', [])
+            st.markdown(
+                f"- **{g.get('name', '(無名)')}**：{len(members)}店舗 "
+                f"<span style='color:#888;font-size:0.9em'>"
+                f"（{', '.join(members) if members else '所属なし'}）"
+                f"</span>",
+                unsafe_allow_html=True,
+            )
+        unassigned = [s for s in all_stores if s not in store_to_group]
+        if unassigned:
+            st.caption(f"未割り当て {len(unassigned)} 店舗：{', '.join(unassigned)}")
+    else:
+        st.info("まだグループが登録されていません。下の表で店舗ごとに「グループ名」を入力してください。")
+
+    st.markdown("#### ✏️ 店舗ごとの所属（自由入力）")
+    st.caption(
+        "**グループ名を直接入力**してください。"
+        "同じ文字列を入力した店舗が1つのグループになります。"
+        "空欄＝未割り当て。1店舗1グループのみ（複数所属は不可）。"
+    )
+    assignment_df = pd.DataFrame({
+        '店舗': stores_to_show,
+        'グループ': [store_to_group.get(s, '') for s in stores_to_show],
+    })
+
+    edited = st.data_editor(
+        assignment_df,
+        num_rows='fixed',
+        use_container_width=False,
+        width=520,
+        key='store_groups_editor',
+        column_config={
+            '店舗': st.column_config.TextColumn('店舗', width=200, disabled=True),
+            'グループ': st.column_config.TextColumn(
+                'グループ名（自由入力）', width=280,
+                help='例：福岡市内エリア／筑紫郡エリア／粕屋郡エリア など',
+            ),
+        },
+    )
+
+    c_save, c_clear, _ = st.columns([1.4, 1.2, 3])
+    if c_save.button('💾 グルーピング保存', key='save_store_groups', type='primary'):
+        new_groups_dict = {}
+        for _, r in edited.iterrows():
+            gn = str(r['グループ']).strip()
+            if not gn:
+                continue
+            new_groups_dict.setdefault(gn, []).append(str(r['店舗']).strip())
+        new_groups = [
+            {'name': k, 'stores': sorted(v)}
+            for k, v in sorted(new_groups_dict.items())
+        ]
+        save_store_groups({
+            'groups': new_groups,
+            '_updated_at': datetime.datetime.now().isoformat(),
+        })
+        st.success(
+            f'✅ 保存しました（{len(new_groups)} グループ '
+            f'／ {sum(len(g["stores"]) for g in new_groups)} 店舗割当）'
+        )
+        st.rerun()
+
+    if c_clear.button('🗑️ すべてクリア', key='clear_store_groups'):
+        save_store_groups({
+            'groups': [],
+            '_updated_at': datetime.datetime.now().isoformat(),
+        })
+        st.success('✅ クリアしました')
+        st.rerun()
+
+    with st.expander("ℹ️ 店舗グルーピングの設計方針", expanded=False):
+        st.markdown("""
+- **目的**：📦 エリア在庫タブで、同じエリア内の店舗の在庫を横断的に確認・移動計画を立てる
+- **制約**：1店舗は1グループにのみ所属（複数所属は仕様上不可）
+- **保存先**：`data/store_groups.json`
+- **設計方針**：CLAUDE.md §5.1.5「店舗スコープと将来拡張への備え」の具体化
+- **編集**：このタブで随時編集できます。設定変更は即座に他タブに反映されます
+""")
+
+
+# ==========================================================
+# 📡 データモニタリング（異常検知）ヘルパー — 2026-06-08 追加（Step1）
+# 全店横断で A:在庫切れ緊急 / B:取込健全性 / C:二重計上 / D:マスタ未登録 を監視。
+# 原則4：検知と"振り先"のみ（対策は出さない）。利用者＝本部・設計視点。
+# A は calculate_flow_cached を全店×2回呼ぶ重い処理のためボタンで実行。B/C/Dは pkl直読みで軽量。
+# ==========================================================
+def _dm_store_margins(store, today):
+    """1店の計画/実績の余裕日数を原料単位で返す（⓪余裕日数のロジックを計画/実績2軸へ拡張）。"""
+    loaded = st.session_state.loaded
+    adj = get_adjustments_for_store(store)
+    try:
+        act_max = loaded['actual_prod']['日付_d'].dropna().max()
+    except Exception:
+        act_max = None
+    df_pln = calculate_flow_cached(store, None, 3, 0.7, 0.9, adj)
+    df_act = calculate_flow_cached(store, act_max, 3, 0.7, 0.9, adj)
+    if df_pln is None or df_act is None or df_pln.empty or df_act.empty:
+        return pd.DataFrame()
+    if '原料JAN' not in df_pln.columns or '日付' not in df_pln.columns:
+        return pd.DataFrame()
+    week_end = today + datetime.timedelta(days=7)
+    pweek = df_pln[(df_pln['日付'] >= today) & (df_pln['日付'] <= week_end)]
+    usage = pweek.groupby('原料JAN')['出'].mean()
+
+    def _cur(df):
+        if today in set(df['日付'].values):
+            c = df[df['日付'] == today]
+        else:
+            past = df[df['日付'] <= today]['日付']
+            ref = past.max() if len(past) else df['日付'].min()
+            c = df[df['日付'] == ref]
+        return c.groupby('原料JAN')['残'].last()
+
+    meta = df_pln.drop_duplicates('原料JAN').set_index('原料JAN')[['原料名', '原料区分']]
+    out = meta.copy()
+    out['1日使用量'] = usage
+    out['現在残_計画'] = _cur(df_pln)
+    out['現在残_実績'] = _cur(df_act)
+    out = out[out['1日使用量'] > 0].copy()
+    if out.empty:
+        return pd.DataFrame()
+    out['計画余裕'] = out['現在残_計画'] / out['1日使用量']
+    out['実績余裕'] = out['現在残_実績'] / out['1日使用量']
+    out['店舗'] = store
+    out = out.reset_index()  # 原料JAN を列へ
+    # 棚卸opening（その店の最新棚卸日に在庫計上があるか）。データ未整備の切り分け用：
+    # opening無しで残が構造的にマイナス＝在庫として管理されていない（振替/IN加工等）＝真の在庫切れでない。
+    opened = set()
+    try:
+        inv = loaded.get('inventory')
+        if inv is not None and '店舗名' in inv.columns:
+            inv_s = inv[inv['店舗名'] == store]
+            if not inv_s.empty and '棚卸日_d' in inv_s.columns:
+                od = inv_s['棚卸日_d'].dropna().max()
+                jcol = 'JAN' if 'JAN' in inv_s.columns else '原料JAN'
+                opened = set(inv_s[inv_s['棚卸日_d'] == od][jcol].astype(str))
+    except Exception:
+        opened = set()
+    out['棚卸opening'] = out['原料JAN'].astype(str).isin(opened)
+    # 管理対象原料に絞る（⓪余裕日数・既存タブと同一）。
+    out = filter_by_managed_jans(out, load_managed_jans(store))
+    return out
+
+
+def _dm_scan_stockout(today):
+    """全運用店舗の在庫切れ緊急（計画×実績 余裕日数）を集約。"""
+    stores = st.session_state.get('stores', []) or []
+    frames = []
+    for s in stores:
+        try:
+            m = _dm_store_margins(s, today)
+            if m is not None and not m.empty:
+                frames.append(m)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def _dm_data_quality(today):
+    """B:鮮度／C:全列一致重複／D:仮JAN の軽量チェック（pkl直読み）。"""
+    loaded = st.session_state.loaded
+    res = {'fresh': [], 'dup': [], 'kari': 0, 'kari_total': 0, 'kari_rows': pd.DataFrame()}
+    for k in ['actual_prod', 'actual_del']:
+        df = loaded.get(k)
+        dcol = '日付_d' if k == 'actual_prod' else '納品予定日_d'
+        if df is None or dcol not in df.columns:
+            continue
+        mx = pd.to_datetime(df[dcol], errors='coerce').max()
+        if pd.notna(mx):
+            res['fresh'].append((k, mx.date(), (today - mx.date()).days))
+    for k in ['plan', 'plan_del', 'inventory']:
+        df = loaded.get(k)
+        if df is None:
+            continue
+        n = int(df.duplicated().sum())
+        if n:
+            res['dup'].append((k, n))
+    ap = loaded.get('actual_prod')
+    if ap is not None and 'JAN' in ap.columns:
+        mask = ap['JAN'].astype(str).str.startswith('9992')
+        res['kari_total'] = int(mask.sum())
+        if res['kari_total']:
+            uniq = ap[mask].drop_duplicates(['JAN'])
+            res['kari'] = int(len(uniq))
+            cols = [c for c in ['店舗名', 'JAN', '商品名', '製造数', '日付'] if c in ap.columns]
+            res['kari_rows'] = uniq[cols].head(50)
+    return res
+
+
+# ========== タブ10：管理者設定（全体に関わる管理機能） ==========
+# データ再取込など、店舗をまたいで影響する機能を集約
+with tab10:
+    st.subheader("🛠️ 管理者設定")
+    st.caption("全店舗に影響する管理操作です。慎重に行ってください。")
+    
+    st.markdown("""
+    <div style='
+        background: #fff3e0;
+        border-left: 4px solid #ef6c00;
+        padding: 10px 14px;
+        border-radius: 4px;
+        margin: 8px 0 16px 0;
+        font-size: 0.92rem;
+    '>
+        ⚠️ <b>注意</b>：このタブの操作は全店舗・全データに影響します。本部担当者のみが操作してください。
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # ============================================================
+    # データ取込（正規ルート：convert_raw → update_data に一本化）
+    #   2026-06-06：バッチのダブルクリック運用を管理画面に集約。実行バラつきを排除。
+    #   核ロジック（update_data.py / convert_raw_to_app.py）は変更せず subprocess で呼ぶ。
+    # ============================================================
+    st.markdown("### 📦 データ取込（正規ルート）")
+    st.caption("毎日の差分・基礎ファイルの取込はここから。バッチのダブルクリックは不要です。")
+
+    # 直前の取込ログがあれば表示（rerun をまたいで結果を残す）
+    if st.session_state.get('_import_log'):
+        _ok = st.session_state.get('_import_ok', False)
+        (st.success if _ok else st.error)(
+            "✅ 取込が完了しました" if _ok else "❌ 取込でエラーがありました（下のログを確認）"
+        )
+        with st.expander("📜 実行ログ", expanded=not _ok):
+            st.code(st.session_state['_import_log'][-6000:], language='text')
+        if st.button("ログを消す", key='_clear_import_log'):
+            st.session_state.pop('_import_log', None)
+            st.session_state.pop('_import_ok', None)
+            st.rerun()
+
+    # 取込種別のガイド（業務プロセスとの対応）
+    st.markdown("""
+<div style='background:#f0f6ff;border-left:4px solid #2e5496;padding:8px 12px;border-radius:4px;font-size:0.9rem;margin:6px 0 12px 0;'>
+<b>置くファイルで種別が自動判定されます</b>（<code>business_system_export\\</code> に配置）<br>
+　🗓️ <b>A 全取込（フル）</b>：月初・棚卸翌日。基礎7ファイル（マスタ・計画・実績・棚卸）<br>
+　📅 <b>B 日次差分</b>：毎日。製造数＋実納品数（YYYYMMDD付）<br>
+　🔧 <b>C 一部取込</b>：随時。納品予定数の差し替え／棚卸修正／マスタ更新
+</div>
+""", unsafe_allow_html=True)
+
+    # 配置状況の見える化
+    _raw_files = _list_csv_brief(RAW_EXPORT_DIR)
+    _ir_files = _list_csv_brief(INPUT_RAW_DIR)
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        st.caption(f"① business_system_export（生ファイル）：{len(_raw_files)}件")
+        st.code('\n'.join(_raw_files) if _raw_files else '（空）', language='text')
+    with _c2:
+        st.caption(f"② input_raw（整形済み・update対象）：{len(_ir_files)}件")
+        st.code('\n'.join(_ir_files) if _ir_files else '（空）', language='text')
+
+    st.markdown("**取込を実行**（① 整形 → ② 取込 の順。通常は『整形＋取込』を押すだけ）")
+    _b1, _b2, _b3 = st.columns(3)
+
+    def _finish(ok, log, reload_after):
+        st.session_state['_import_log'] = log
+        st.session_state['_import_ok'] = ok
+        if ok and reload_after:
+            rok, rmsg = reload_pkl_into_session()
+            st.session_state['_import_ok'] = rok
+            st.session_state['_import_log'] += f"\n\n[pkl再読込] {rmsg}"
+        st.rerun()
+
+    with _b1:
+        if st.button("① 整形（convert_raw）", use_container_width=True, key='_btn_convert'):
+            with st.spinner("整形中（convert_raw_to_app.py）..."):
+                ok, log = run_pipeline_script('convert_raw_to_app.py')
+            _finish(ok, log, reload_after=False)
+    with _b2:
+        if st.button("② 取込（update_data）", use_container_width=True, key='_btn_update'):
+            with st.spinner("取込中（update_data.py）..."):
+                _moved, _qd = auto_quarantine_fullload_for_diff()
+                ok, log = run_pipeline_script('update_data.py')
+            if _moved:
+                log = (f"[自動退避] 差分日のため、残置していた日付なしフルロード{len(_moved)}ファイルを "
+                       f"{_qd}\\ へ退避しました（混在エラー回避・可逆）:\n  " + ", ".join(_moved)
+                       + "\n\n========== update_data ==========\n") + log
+            _finish(ok, log, reload_after=True)
+    with _b3:
+        if st.button("🔄 整形＋取込（推奨）", type='primary', use_container_width=True, key='_btn_both'):
+            with st.spinner("整形→取込を実行中..."):
+                ok1, log1 = run_pipeline_script('convert_raw_to_app.py')
+                if ok1:
+                    # 整形後・取込前に、差分日の残置フルロード7ファイルを自動退避（混在エラー回避）
+                    _moved, _qd = auto_quarantine_fullload_for_diff()
+                    ok2, log2 = run_pipeline_script('update_data.py')
+                    _q = (f"[自動退避] 差分日のため、残置していた日付なしフルロード{len(_moved)}ファイルを "
+                          f"{_qd}\\ へ退避しました（混在エラー回避・可逆）:\n  " + ", ".join(_moved) + "\n\n") if _moved else ""
+                    _finish(ok2, log1 + "\n\n========== update_data ==========\n" + _q + log2, reload_after=True)
+                else:
+                    _finish(False, log1 + "\n\n[中止] 整形でエラーのため取込はスキップしました。", reload_after=False)
+
+    # 従来ルート（変換済み7CSVの直接アップロード＝全置換）を上級者向けに残す
+    with st.expander("（上級）変換済み7CSVを直接アップロードして全置換", expanded=False):
+        st.caption("※ convert済みの正しい列構成のCSVのみ。生ファイルは不可（KeyErrorになる）。通常は上の正規ルートを使う。")
+        uploaded_files_reload = st.file_uploader(
+            "7つのCSVファイル（順不同・複数選択可）",
+            type=['csv'],
+            accept_multiple_files=True,
+            key='uploader_reload',
+        )
+        if uploaded_files_reload:
+            st.info(f"📁 {len(uploaded_files_reload)} ファイルが選択されました")
+            if st.button("📥 直接全置換で取込", key='reload_btn'):
+                with st.spinner("読み込み中..."):
+                    if process_uploaded_files(uploaded_files_reload):
+                        st.session_state.data_version = st.session_state.get('data_version', 0) + 1
+                        st.success("✅ 再読込完了")
+                        st.rerun()
+
+    st.divider()
+
+    # ============================================================
+    # 📡 データモニタリング（異常検知）Step1 — 2026-06-08
+    # ============================================================
+    st.markdown("### 📡 データモニタリング（異常検知）")
+    st.caption("全店横断で『緊急に動くべきケース』と『データの異常』を監視します。検知と“振り先”のみで、対策（増やせ／減らせ）は出しません。利用者＝本部・設計視点。")
+
+    _dm_today = datetime.date.today()
+    _dq = _dm_data_quality(_dm_today)
+
+    # ---- 📊 全体サマリー（担当別）----
+    st.markdown("#### 📊 全体サマリー（担当別）")
+    _res0 = st.session_state.get('_dm_result')
+    _a_done = _res0 is not None and hasattr(_res0, 'empty') and not _res0.empty
+    if _a_done:
+        if '棚卸opening' not in _res0.columns:
+            _res0['棚卸opening'] = True
+        _mg0 = _res0[_res0['棚卸opening']]
+        _dp0 = _mg0['計画余裕'] < 2
+        _da0 = _mg0['実績余裕'] < 2
+        _n1 = int((_dp0 & _da0).sum())
+        _n2 = int((_dp0 & ~_da0).sum())
+        _n3 = int((~_dp0 & _da0).sum())
+        _nundev = int((((_res0['計画余裕'] < 2) | (_res0['実績余裕'] < 2)) & (~_res0['棚卸opening'])).sum())
+    else:
+        _n1 = _n2 = _n3 = _nundev = None
+    _nC = sum(n for _, n in _dq['dup'])
+    _nD = _dq['kari']
+    _nBwarn = sum(1 for _, _, days in _dq['fresh'] if days >= 3)
+    _sg1, _sg2, _sg3, _sg4 = st.columns(4)
+    _sg1.metric("🏪 現場（要現物確認・補正）", f"{_n1 + _n3}件" if _a_done else "—",
+                help="A①最優先＋A③実態ズレ。現場が現物で確認・補正。未スキャンは『—』。")
+    _sg2.metric("📐 齋藤さん（計画）", f"{_n2}件" if _a_done else "—",
+                help="A②計画段＝計画作成で吸収すべき不足（上流）。")
+    _sg3.metric("🗂 松本君（データ整備）", f"{_nC + _nD + (_nundev or 0)}件",
+                help="C二重計上＋D仮JAN＋データ未整備（マスタ・データ設定）。")
+    _sg4.metric("🔧 取込健全性", "⚠ 要確認" if _nBwarn else "✅ 正常",
+                help="B：実績(製造/実納品)の取込鮮度。")
+    if not _a_done:
+        st.caption("※ A（在庫切れ緊急）と『データ未整備』は、下の『🔄 在庫切れ緊急を全店スキャン』を押すと集計され、ここに反映されます。")
+    st.divider()
+
+    # ---- B 取込の鮮度・欠損 ----
+    st.markdown("**B｜取込の鮮度・欠損**　／　振り先：データ取得・取込プロセス")
+    if _dq['fresh']:
+        _bc = st.columns(len(_dq['fresh']))
+        for i, (k, mx, days) in enumerate(_dq['fresh']):
+            label = {'actual_prod': '製造実績', 'actual_del': '実納品'}.get(k, k)
+            _bc[i].metric(f"{'🚨' if days >= 3 else '✅'} {label} 最終日", str(mx), f"{days}日前", delta_color="inverse")
+    else:
+        st.caption("（鮮度判定対象データなし）")
+
+    # ---- C 二重計上（全列一致の重複）----
+    st.markdown("**C｜二重計上（全列一致の重複）**　／　振り先：松本君（データ整備・ソース確認）")
+    if _dq['dup']:
+        for k, n in _dq['dup']:
+            st.warning(f"⚠️ {k}：全列一致の重複 {n}件（計画・予定・棚卸系。calculate_flowが合算するため二重計上の恐れ）")
+    else:
+        st.success("✅ 計画・予定・棚卸系に全列一致の重複なし（ロード層dedupが機能）")
+
+    # ---- D マスタ未登録（仮JAN 9992…）----
+    st.markdown("**D｜マスタ未登録（仮JAN 9992…）**　／　振り先：松本君（マスタ整備・正本オーナー）")
+    if _dq['kari_total']:
+        st.warning(f"⚠️ 製造実績に仮JAN {_dq['kari']}商品（{_dq['kari_total']}行）。レシピ未登録で、その原料消費が在庫推移に乗りません（在庫計算の死角）。")
+        with st.expander(f"該当の仮JAN商品を見る（最大50件）"):
+            st.dataframe(_dq['kari_rows'], use_container_width=True, hide_index=True)
+    else:
+        st.success("✅ 仮JANなし")
+
+    # ---- A 在庫切れ緊急（計画×実績の余裕日数2軸）----
+    st.markdown("**A｜在庫切れ緊急（計画×実績の余裕日数2軸）**　／　振り先：①要 現場現物確認→手当て ②齋藤さん計画 ③現場・補正")
+    st.caption("①計画も実績も危険＝最優先　②計画のみ危険＝計画段で吸収すべき（上流）　③実績のみ危険＝実態がズレ始め（現場・補正）。危険＝余裕<2日。")
+    st.caption("※ ①②③はデータ上の“候補”です。特に①は、真に手当てすべきかを**現場が現物で確認して初めて確定**します（データだけで断定しない＝判断は人に残す）。B/C/D・データ未整備はデータだけで判定できる異常です。")
+    if st.button("🔄 在庫切れ緊急を全店スキャン", key='_dm_scan'):
+        with st.spinner("全店の計画/実績 余裕日数を計算中..."):
+            st.session_state['_dm_result'] = _dm_scan_stockout(_dm_today)
+            st.session_state['_dm_scanned_at'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    _res = st.session_state.get('_dm_result')
+    if _res is None:
+        st.caption("※ ボタンを押すと全店の計画/実績 余裕日数を計算し ①②③ に分類します（重い処理のため手動実行）。粕屋CK等の計画なし拠点は対象外。")
+    elif _res.empty:
+        st.info("対象データなし、または計算可能な原料がありませんでした。")
+    else:
+        if '棚卸opening' not in _res.columns:
+            _res['棚卸opening'] = True
+        # データ未整備：棚卸opening無で危険判定＝在庫として管理されていない（真の在庫切れと分離）
+        _danger_any = (_res['計画余裕'] < 2) | (_res['実績余裕'] < 2)
+        _cat_d = _res[_danger_any & (~_res['棚卸opening'])]
+        # 真の①②③ は opening 有り（在庫管理されている原料）に限定
+        _mg = _res[_res['棚卸opening']]
+        _dp = _mg['計画余裕'] < 2
+        _da = _mg['実績余裕'] < 2
+        _cat1 = _mg[_dp & _da]
+        _cat2 = _mg[_dp & ~_da]
+        _cat3 = _mg[~_dp & _da]
+        _m1, _m2, _m3, _m4 = st.columns(4)
+        _m1.metric("① 最優先・要現物確認", f"{len(_cat1)}件", help="計画も実績も危険。ただしデータ上の候補で、真に手当てすべきかは現場の現物確認で確定（判断は人）。")
+        _m2.metric("② 計画段の不足（計画が危険）", f"{len(_cat2)}件")
+        _m3.metric("③ 実態ズレ（実績のみ危険）", f"{len(_cat3)}件")
+        _m4.metric("⚠ データ未整備（棚卸なし）", f"{len(_cat_d)}件",
+                   help="棚卸openingが無く残が構造的にマイナス＝在庫として管理されていない（振替/IN加工等）。振り先はマスタ/データ整備（D系・情物一致の死角）。①②③からは除外。")
+        st.caption(f"スキャン: {st.session_state.get('_dm_scanned_at', '')}　/　基準日 {_dm_today}　/　危険＝余裕<2日　/　①②③は棚卸opening有りの原料のみ")
+        _show = pd.concat([
+            _cat1.assign(緊急度='①最優先(要現物確認)'),
+            _cat2.assign(緊急度='②計画段'),
+            _cat3.assign(緊急度='③実態ズレ'),
+        ], ignore_index=True)
+        if _show.empty:
+            st.success("✅ 在庫切れ緊急（①②③）に該当する原料はありません（棚卸opening有り原料）。")
+        else:
+            _multi = _show.groupby('原料名')['店舗'].nunique()
+            _multi_names = _multi[_multi >= 2].index.tolist()
+            if _multi_names:
+                st.info(f"🔁 複数店で同時に緊急の原料（計画・マスタの構造問題シグナル）：{'、'.join(_multi_names[:10])}")
+            _show = _show.sort_values(['緊急度', '実績余裕'])
+            _disp = _show[['緊急度', '店舗', '原料名', '原料区分', '計画余裕', '実績余裕', '現在残_実績', '1日使用量', '原料JAN']].copy()
+            for _c in ['計画余裕', '実績余裕', '現在残_実績']:
+                _disp[_c] = _disp[_c].round(1)
+            _disp['1日使用量'] = _disp['1日使用量'].round(2)
+            st.dataframe(_disp, use_container_width=True, hide_index=True)
+        # データ未整備（棚卸opening無）は別枠で（振り先＝マスタ/データ整備）
+        if not _cat_d.empty:
+            with st.expander(f"⚠ データ未整備（棚卸opening無）{len(_cat_d)}件 — 振り先：松本君（マスタ/データ整備・情物一致の死角）"):
+                _dd = _cat_d.sort_values('実績余裕')[['店舗', '原料名', '原料区分', '計画余裕', '実績余裕', '原料JAN']].copy()
+                for _c in ['計画余裕', '実績余裕']:
+                    _dd[_c] = _dd[_c].round(1)
+                st.dataframe(_dd, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ============================================================
+    # Google Chat Webhook 設定
+    # ============================================================
+    st.markdown("### 💬 Google Chat 連携設定")
+    st.caption("サマリータブから Google Chat にメッセージを送信する機能の設定です")
+    
+    current_webhook = load_webhook_url()
+    
+    if current_webhook:
+        # 既存のURLは末尾だけ表示（セキュリティ）
+        masked = current_webhook[:50] + "..." if len(current_webhook) > 50 else current_webhook
+        st.success(f"✅ Webhook URL 設定済み：`{masked}`")
+    else:
+        st.info("ℹ️ Webhook URL は未設定です。設定するとサマリーをGoogle Chatに自動送信できます。")
+    
+    new_url = st.text_input(
+        "Google Chat の Webhook URL",
+        value=current_webhook or "",
+        placeholder="https://chat.googleapis.com/v1/spaces/...",
+        type='password' if current_webhook else 'default',
+        help="Google Chat スペースで「アプリと統合」→「Webhook」から発行できます",
+    )
+    
+    wcol1, wcol2, _wcol3 = st.columns([1, 1, 2])
+    with wcol1:
+        if st.button("💾 Webhook URLを保存", type='primary', use_container_width=True):
+            if not new_url.strip():
+                st.warning("⚠️ URLを入力してください")
+            elif not new_url.startswith('https://chat.googleapis.com/'):
+                st.error("❌ Google Chat の Webhook URL ではないようです（https://chat.googleapis.com/ で始まる必要があります）")
+            else:
+                if save_webhook_url(new_url.strip()):
+                    st.success("✅ Webhook URL を保存しました")
+                    st.rerun()
+    with wcol2:
+        if current_webhook:
+            if st.button("🚫 設定を削除", use_container_width=True):
+                try:
+                    WEBHOOK_CONFIG_PATH.unlink()
+                    st.success("✅ 設定を削除しました")
+                    st.rerun()
+                except Exception:
+                    st.info("設定ファイルがありません")
+    
+    # テスト送信
+    if current_webhook:
+        with st.expander("🧪 テスト送信", expanded=False):
+            st.caption("実際にメッセージを送信して、設定が正しいか確認できます")
+            if st.button("テストメッセージを送信", key='_test_webhook'):
+                test_msg = (
+                    "✅ *在庫管理アプリ：テスト送信*\n\n"
+                    "この設定で Google Chat にメッセージを送信できます。\n"
+                    f"送信時刻：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+                with st.spinner("送信中..."):
+                    result = send_to_google_chat(test_msg, current_webhook)
+                if result is True:
+                    st.success("✅ テスト送信成功！Google Chatを確認してください")
+                else:
+                    st.error(f"❌ {result}")
+    
+    # Webhook URL の取得方法
+    with st.expander("❓ Webhook URL の取得方法", expanded=False):
+        st.markdown("""
+        **Google Chat スペースで Webhook を発行する手順：**
+        
+        1. 送信先にしたい Google Chat スペースを開く
+        2. スペース名の右にある「▼」をクリック → 「アプリと統合」
+        3. 「Webhook を追加」をクリック
+        4. 名前（例：「在庫管理アプリ」）を入力して「保存」
+        5. 表示された URL をコピーして上の入力欄に貼り付け
+        
+        ※ Google Workspace の管理者がWebhook機能を有効にしている必要があります。
+        ※ 取得した URL は他人に教えないでください（誰でもメッセージを送れてしまいます）。
+        """)
+    
+    st.divider()
+    
+    # ============================================================
+    # 永続化ファイルの場所（参考情報）
+    # ============================================================
+    with st.expander("📂 永続化ファイルの場所（上級者向け）", expanded=False):
+        st.code(f"""
+データ本体: {SAVE_PATH}
+ズレ補正値: {ADJUSTMENTS_PATH}
+管理対象（共通）: {get_managed_jans_path(None)}
+管理対象（店舗別の例: {selected_store}）: {get_managed_jans_path(selected_store)}
+Webhook設定: {WEBHOOK_CONFIG_PATH}
+        """.strip())
+        st.caption(
+            "これらのファイルはアプリのデータフォルダ（data/）に保存されます。"
+            "バックアップしておくと、何かあったときに復元できます。"
+        )

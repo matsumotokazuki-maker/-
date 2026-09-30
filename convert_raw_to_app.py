@@ -1,0 +1,987 @@
+"""
+convert_raw_to_app.py
+======================
+業務システムから出力された生ファイルを、update_data.py が期待する
+「指定の形」のCSV（UTF-8 BOM）に変換するスクリプト。
+
+【サポートしているファイル種別】
+
+(1) 製造数CSV（CP932、ファイル名例：20260506製造数.CSV）
+    → 20260506製造数.csv（UTF-8 BOM）に変換
+    → 製造数 = 売上数量 + 廃棄数
+
+(2) 納品予定確認xls/xlsx（シート「納品予定情報」）
+    → 1ファイルから複数CSVに分離：
+       - 20260506納品予定数.csv（通常店舗の仕入レコード）
+       - 20260506実納品数.csv（同上、仕入計上数を実納品数として）
+       - 20260506製造数.csv に粕屋CK等の「振出庫」を製品判定して統合
+
+(3) 棚卸データ.csv（UTF-8、年無し日付「2月28日」など）
+    → 棚卸データ.csv（年補完して「2026/02/28」に変換）
+
+(4) 計画数データ.csv（UTF-8、年無し日付）
+    → 計画数データ.csv（同上）
+
+(5) レシピデータ.csv / 原料データ.csv（UTF-8）
+    → そのまま出力（JAN末尾空白除去のみ）
+
+【共通の変換ルール】
+- 店舗名：「店」が付いていない店舗には「店」を付与（例：「田村」→「田村店」）
+- CK・プロセスセンター等：そのまま（既に末尾が「CK」「センター」など）
+- JAN：末尾空白除去。20桁ゼロパディングは中身そのまま渡す（update_data.py で原料名突合）
+- 日付：YYYY/MM/DD 形式に統一、年無し日付は年補完
+- エンコーディング：UTF-8 (BOM)
+
+【粕屋CK振出庫の特殊処理】
+納品予定確認の中で「店舗名=粕屋CK等」「伝票区分名=振出庫」のレコードは
+製造数CSVに統合する。商品JAN突合は4分岐：
+  1. JANがレシピの商品JANに完全一致 → そのまま
+  2. 商品名で正規化突合してレシピと完全一致 → レシピのJANに置換
+  3. 部分一致または複数候補 → 警告ログ＆スキップ
+  4. レシピに無い → 仮JAN（9992xxx）で記録、警告ログ
+
+使い方:
+  1. business_system_export フォルダに生ファイルを置く
+  2. convert_raw.bat ダブルクリック
+  3. input_raw に変換済みファイルが出力される
+  4. update_data.bat ダブルクリック → アプリ反映
+"""
+import sys
+import re
+import unicodedata
+import datetime
+from pathlib import Path
+
+# Windows の既定コンソールは cp932 のため、絵文字（⚠️📝 等）を print すると
+# UnicodeEncodeError でクラッシュする。標準出力/エラーを utf-8 化して一括で防ぐ。
+# （errors='replace' で万一未対応文字があっても落とさない）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding='utf-8', errors='replace')
+    except (AttributeError, ValueError):
+        pass
+
+try:
+    import pandas as pd
+except ImportError:
+    print("\n[ERROR] pandas がインストールされていません。")
+    print("コマンドプロンプトで以下を実行してください:")
+    print("  pip install pandas openpyxl")
+    input("\nEnter キーで終了...")
+    sys.exit(1)
+
+
+# ========== パス設定 ==========
+BASE_DIR = Path(__file__).parent
+SRC_DIR = BASE_DIR / 'business_system_export'  # 業務システムの生ファイル
+DST_DIR = BASE_DIR / 'input_raw'                # update_data.py が読む場所
+WARNING_LOG_PATH = BASE_DIR / 'convert_warnings.log'
+
+# CK拠点の判定キーワード（店舗名末尾）
+CK_KEYWORDS = ['CK', 'センター', 'プロセスセンター']
+
+
+# ========== 正規化関数 ==========
+def normalize_name(s):
+    """商品名・原料名を比較しやすい正規化キーに変換（update_data.py と同じロジック）"""
+    if pd.isna(s):
+        return ''
+    s = str(s)
+    s = unicodedata.normalize('NFKC', s)
+    s = re.sub(r'\s+', '', s)
+    s = re.sub(r'[_\-\u2010\u2014\uff3f\uff0d\u30fc/\uff0f\u30fb]', '', s)
+    s = s.replace('\uff08', '(').replace('\uff09', ')')
+    s = s.replace('\u300c', '').replace('\u300d', '')
+    s = s.replace('\u3010', '').replace('\u3011', '')
+    s = s.upper()
+    return s
+
+
+def normalize_jan(s):
+    """JAN/CD\u309213\u6841\u6587\u5b57\u5217\u306b\u6b63\u898f\u5316\u3059\u308b\u3002
+    xls/csv \u304c\u6570\u5024\u3068\u3057\u3066\u8aad\u3080\u3068 '2831000052052.0' \u306e\u3088\u3046\u306b\u672b\u5c3e .0 \u304c\u4ed8\u304f\u305f\u3081\u3001
+    \u305d\u308c\u3092\u9664\u53bb\u3057\u3066\u6587\u5b57\u5217\u5316\u3059\u308b\uff082026-05-28 \u691c\u8a3cPC\u7531\u6765\u30012026-05-30 \u500b\u4ebaPC\u3078\u53d6\u8fbc\uff1a
+    .0 \u6d6e\u52d5\u5c0f\u6570\u5316\u5bfe\u7b56\uff1d\u5dee\u5206\u66f4\u65b0\u30d5\u30ed\u30fc\u306e\u30d0\u30b03\uff09\u3002
+    """
+    if pd.isna(s):
+        return ''
+    s = str(s).strip()
+    if s == '' or s.lower() == 'nan':
+        return ''
+    # \u672b\u5c3e .0\uff08.00 \u7b49\u3082\uff09\u3092\u9664\u53bb\uff1a'2831000052052.0' \u2192 '2831000052052'
+    m = re.fullmatch(r'(\d+)\.0+', s)
+    if m:
+        s = m.group(1)
+    return s
+
+
+def normalize_store_name(name):
+    """店舗名を統一。CK/センター等以外は末尾に「店」を付ける。"""
+    if pd.isna(name) or not str(name).strip():
+        return name
+    name = str(name).strip()
+    if name.endswith('店'):
+        return name
+    for kw in CK_KEYWORDS:
+        if name.endswith(kw):
+            return name
+    return name + '店'
+
+
+def is_ck_location(name):
+    """店舗名がCK・プロセスセンター等の生産拠点か判定"""
+    if pd.isna(name):
+        return False
+    name = str(name).strip()
+    for kw in CK_KEYWORDS:
+        if name.endswith(kw):
+            return True
+    return False
+
+
+# ========== 日付関連 ==========
+def parse_date_to_iso(s):
+    """日付文字列を YYYY/MM/DD 形式に統一。年がなければ年補完。"""
+    if pd.isna(s):
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    
+    # YYYYMMDD（区切りなし8桁）
+    m = re.match(r'^(\d{4})(\d{2})(\d{2})$', s)
+    if m:
+        return f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+    
+    # YYYY/M/D（4桁年あり）
+    m = re.match(r'^(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})', s)
+    if m:
+        return f"{m.group(1)}/{int(m.group(2)):02d}/{int(m.group(3)):02d}"
+    
+    # 「2月28日」のような年なし日付
+    m = re.match(r'^(\d{1,2})月(\d{1,2})日$', s)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        return complete_year(month, day)
+    
+    # 「02/28」「2/28」のような年なし日付
+    m = re.match(r'^(\d{1,2})[/\-](\d{1,2})$', s)
+    if m:
+        month = int(m.group(1))
+        day = int(m.group(2))
+        return complete_year(month, day)
+    
+    return s  # 認識できない形式はそのまま返す
+
+
+def complete_year(month, day):
+    """月日だけある日付に、現在に最も近い年を補完。
+    
+    今日と前後1年で最も近い候補を選ぶ：
+      - 「2月28日」が今日5/7なら 2026/02/28 を選ぶ（68日前）
+      - 「12月15日」が今日5/7なら 2025/12/15 を選ぶ（143日前）
+      - 「6月15日」が今日5/7なら 2026/06/15 を選ぶ（39日後）
+    """
+    today = datetime.date.today()
+    candidates = []
+    for year_offset in [-1, 0, 1]:
+        year = today.year + year_offset
+        try:
+            d = datetime.date(year, month, day)
+            candidates.append((abs((d - today).days), year, d))
+        except ValueError:
+            continue
+    if not candidates:
+        return f"{today.year}/{month:02d}/{day:02d}"
+    candidates.sort()
+    _, year, d = candidates[0]
+    return f"{year}/{month:02d}/{day:02d}"
+
+
+def get_yyyymmdd_from_iso(iso_date):
+    """YYYY/MM/DD 形式から YYYYMMDD を取り出す"""
+    if not iso_date:
+        return None
+    m = re.match(r'^(\d{4})/(\d{2})/(\d{2})', str(iso_date))
+    if m:
+        return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    return None
+
+
+# ========== ヘルパー ==========
+def print_section(title):
+    print(f"\n{'='*60}")
+    print(f"  {title}")
+    print('='*60)
+
+
+def read_csv_safely(path, encoding='utf-8-sig'):
+    """CSVを読み込む。BOMありUTF-8をデフォルト。"""
+    df = pd.read_csv(path, dtype=str, encoding=encoding)
+    df.columns = df.columns.str.strip().str.replace('\ufeff', '')
+    return df
+
+
+def read_csv_cp932(path):
+    """Shift-JIS（CP932）のCSVを読み込む"""
+    df = pd.read_csv(path, dtype=str, encoding='cp932')
+    df.columns = df.columns.str.strip().str.replace('\ufeff', '')
+    return df
+
+
+def strip_jan(df, col='JAN'):
+    """指定列の前後空白を除去"""
+    if col in df.columns:
+        df[col] = df[col].astype(str).str.strip()
+    return df
+
+
+# 警告ログを蓄積
+WARNINGS = []
+
+
+def log_warning(msg):
+    """警告メッセージをログに追加"""
+    WARNINGS.append(msg)
+    print(f"  [WARN] {msg}")
+
+
+def save_warnings_log():
+    """警告ログをファイルに書き出す"""
+    if not WARNINGS:
+        return
+    try:
+        with open(WARNING_LOG_PATH, 'w', encoding='utf-8') as f:
+            f.write(f"convert_raw_to_app.py の警告ログ\n")
+            f.write(f"実行日時: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"警告件数: {len(WARNINGS)}\n")
+            f.write('=' * 60 + '\n\n')
+            for i, msg in enumerate(WARNINGS, 1):
+                f.write(f"{i}. {msg}\n")
+        print(f"\n  📝 警告ログ: {WARNING_LOG_PATH}")
+    except Exception as e:
+        print(f"  [ERROR] 警告ログ保存失敗: {e}")
+
+
+# ========== マスタ読込（粕屋CK振出庫の判定に使う） ==========
+def load_master_for_lookup():
+    """レシピと原料マスタを読み込み、粕屋CK振出庫の判定用辞書を返す。
+    
+    優先順位：
+      1. business_system_export にレシピ・原料マスタがあればそれを使う
+      2. なければ input_raw から読む（前回フルロード時のもの）
+      3. それもなければ None を返す（CK判定はスキップ）
+    """
+    rec_paths = [SRC_DIR / 'レシピデータ.csv', DST_DIR / 'レシピデータ.csv']
+    mat_paths = [SRC_DIR / '原料データ.csv', DST_DIR / '原料データ.csv']
+    
+    rec_path = next((p for p in rec_paths if p.exists()), None)
+    mat_path = next((p for p in mat_paths if p.exists()), None)
+    
+    if not rec_path or not mat_path:
+        return None
+    
+    rec = read_csv_safely(rec_path)
+    mat = read_csv_safely(mat_path)
+    rec = strip_jan(rec, 'JAN')
+    rec = strip_jan(rec, '原料JAN')
+    mat = strip_jan(mat, '原料JAN')
+    
+    # 商品JANのセット（完全一致用）
+    product_jans = set(rec['JAN'].dropna().unique())
+
+    # [Phase3] 原料マスタの原料JANセット（非CK振替の 原料/商品 判定に使用）
+    material_jans = set(mat['原料JAN'].apply(normalize_jan).dropna().unique())
+
+    # 商品名→JAN の正規化キー辞書（商品名突合用）
+    rec['商品名_orig'] = rec['商品名'].astype(str).str.strip()
+    rec['_pkey'] = rec['商品名_orig'].apply(normalize_name)
+    
+    # 1つの正規化キー → 複数JANの可能性があるので、リストで保持
+    name_to_jans = {}
+    for _, r in rec.iterrows():
+        k = r['_pkey']
+        if not k:
+            continue
+        if k not in name_to_jans:
+            name_to_jans[k] = set()
+        name_to_jans[k].add(r['JAN'])
+    
+    # ユニーク確定（複数JANに紐付くキーは判別保留）
+    name_to_jan_unique = {k: list(v)[0] for k, v in name_to_jans.items() if len(v) == 1}
+    name_to_jan_multi = {k: list(v) for k, v in name_to_jans.items() if len(v) > 1}
+    
+    return {
+        'product_jans': product_jans,
+        'material_jans': material_jans,            # [Phase3] 追加
+        'name_to_jan_unique': name_to_jan_unique,  # パターンA（一意）
+        'name_to_jan_multi': name_to_jan_multi,    # パターンB（複数）
+    }
+
+
+def classify_ck_record(jan, name, master):
+    """粕屋CK振出庫レコードのJAN突合判定。
+    
+    Returns:
+        ('exact', jan): JAN完全一致
+        ('replaced', new_jan): 商品名で一意に紐付け、JAN置換
+        ('skipped', None): 複数候補で判定保留、警告
+        ('fake', new_jan): レシピになし、仮JAN付与
+    """
+    jan = str(jan).strip()
+    
+    # 1. JAN完全一致
+    if jan in master['product_jans']:
+        return ('exact', jan)
+    
+    # 2. 商品名で正規化突合
+    key = normalize_name(name)
+    if key in master['name_to_jan_unique']:
+        return ('replaced', master['name_to_jan_unique'][key])
+    
+    # 3. 複数候補（パターンB）
+    if key in master['name_to_jan_multi']:
+        return ('skipped', None)
+    
+    # 4. レシピに該当なし（パターンC）：仮JAN生成は呼び出し側で
+    return ('fake', None)
+
+
+# ========== ファイル種別判定 ==========
+def detect_file_kind(path):
+    """ファイル名と拡張子から種別を判定"""
+    name = path.name
+    suffix = path.suffix.lower()
+    stem = path.stem  # 拡張子なしの名前
+    
+    # 製造数（CP932生CSV、ファイル名に「製造数」を含む）
+    if suffix in ['.csv'] and '製造数' in stem:
+        return 'production'
+    
+    # 納品予定確認 xls/xlsx
+    if suffix in ['.xls', '.xlsx'] and ('納品' in stem):
+        return 'delivery'
+    
+    # マスタ系
+    if name == 'レシピデータ.csv':
+        return 'recipe'
+    if name == '原料データ.csv':
+        return 'material'
+    
+    # 棚卸・計画数
+    if name == '棚卸データ.csv' or '棚卸' in stem:
+        return 'inventory'
+    if name == '計画数データ.csv' or '計画数' in stem:
+        return 'plan'
+    
+    return None
+
+
+# ========== 各ファイルの変換 ==========
+def convert_production(src_path):
+    """製造数CSV（CP932 生）を変換"""
+    print(f"\n  読込: {src_path.name}（CP932）")
+    df = read_csv_cp932(src_path)
+    print(f"    {len(df)}行 / {len(df.columns)}列")
+    
+    out = pd.DataFrame()
+    out['日付'] = df['日付'].apply(parse_date_to_iso)
+    out['店CD'] = df['店CD'].astype(str).str.strip() if '店CD' in df.columns else ''
+    out['店舗名'] = df['店舗名'].astype(str).str.strip().apply(normalize_store_name)
+    out['JAN'] = df['JAN'].astype(str).str.strip()
+    out['商品名'] = df['商品名'].astype(str).str.strip()
+    
+    sales = pd.to_numeric(df['売上数量'], errors='coerce').fillna(0)
+    waste = pd.to_numeric(df['廃棄数'], errors='coerce').fillna(0)
+    out['製造数'] = (sales + waste).astype(int)
+    
+    # 出力ファイル名：中身の日付から
+    date_str = out['日付'].iloc[0] if len(out) > 0 else None
+    yyyymmdd = get_yyyymmdd_from_iso(date_str)
+    if not yyyymmdd:
+        m = re.match(r'^(\d{8})', src_path.stem)
+        yyyymmdd = m.group(1) if m else datetime.date.today().strftime('%Y%m%d')
+    
+    return out, f"{yyyymmdd}製造数.csv"
+
+
+def convert_delivery(src_path, master=None):
+    """納品予定確認 xls/xlsx を変換。
+    
+    通常店舗の仕入 → 納品予定数.csv & 実納品数.csv
+    粕屋CK等の振出庫 → 製造数.csv（製品判定して統合）
+    
+    Returns:
+        (plan_del_df, actual_del_df, ck_production_df, yyyymmdd)
+    """
+    print(f"\n  読込: {src_path.name}")
+    
+    if src_path.suffix.lower() == '.xls':
+        try:
+            df = pd.read_excel(src_path, sheet_name='納品予定情報', dtype=str, engine='xlrd')
+        except Exception as e:
+            # pandas+xlrd<2.0 で失敗 → xlrd 直接読込にフォールバック (2026-05-13 追加)
+            try:
+                import xlrd
+                xwb = xlrd.open_workbook(str(src_path))
+                sheet_name_use = '納品予定情報' if '納品予定情報' in xwb.sheet_names() else xwb.sheet_names()[0]
+                xws = xwb.sheet_by_name(sheet_name_use)
+                if xws.nrows < 2:
+                    log_warning(f".xls がほぼ空: {src_path.name}")
+                    return None, None, None, None
+                headers = [str(xws.cell_value(0, c)) for c in range(xws.ncols)]
+                rows = [[str(xws.cell_value(r, c)) for c in range(xws.ncols)] for r in range(1, xws.nrows)]
+                df = pd.DataFrame(rows, columns=headers)
+                print(f"    [INFO] xlrd直接読込で復旧（pandas経由失敗: {type(e).__name__}）")
+            except Exception as e2:
+                log_warning(f".xls 読込失敗: {src_path.name} - {e2}")
+                print(f"    対処：このファイルを Excel または LibreOffice で .xlsx として保存し直してください")
+                return None, None, None, None
+    else:
+        df = pd.read_excel(src_path, sheet_name='納品予定情報', dtype=str, engine='openpyxl')
+    
+    print(f"    {len(df)}行 / {len(df.columns)}列")
+    
+    # 必要な列の存在確認
+    required = ['店舗名', 'JAN', '商品名', '伝票区分名', '納品予定数', '仕入計上数', '納品予定日', '店舗CD']
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        log_warning(f"納品予定確認に必要な列が不足: {missing}")
+        return None, None, None, None
+    
+    # ベース整形
+    df['店舗名_norm'] = df['店舗名'].astype(str).str.strip().apply(normalize_store_name)
+    df['JAN'] = df['JAN'].astype(str).str.strip()
+    df['商品名'] = df['商品名'].astype(str).str.strip()
+    df['伝票区分名'] = df['伝票区分名'].astype(str).str.strip()
+    df['納品予定数_n'] = pd.to_numeric(df['納品予定数'], errors='coerce').fillna(0)
+    df['仕入計上数_n'] = pd.to_numeric(df['仕入計上数'], errors='coerce').fillna(0)
+    df['納品予定日_iso'] = df['納品予定日'].apply(parse_date_to_iso)
+    
+    # CK判定（店舗名がCK/センターで終わるもの）
+    df['_is_ck'] = df['店舗名_norm'].apply(is_ck_location)
+    
+    # ============ 1. 通常の納品予定数・実納品数（CK以外、または CKの仕入） ============
+    # 「振出庫」以外のレコード = 仕入レコード
+    normal = df[df['伝票区分名'] != '振出庫'].copy()
+    print(f"    通常レコード（仕入等）: {len(normal)}行")
+    
+    # 通常店舗の納品レコードの「JAN/商品名」は、業務システム上の名称だが
+    # 中身は原料（仕入される原料）。update_data.py の plan_del/actual_del 経路は
+    # いずれも原料ベース（原料JAN・原料名）を要求するため、両方を原料ベースに揃える。
+    # (2026-05-25 修正：plan_del が商品ベースのままで日次差分が落ちていたバグを解消。
+    #  実納品数は 2026-05-13 に対応済みだったが、納品予定数への適用が漏れていた)
+    # (2026-05-30 追加：JAN・店舗CD に normalize_jan を適用し末尾 .0 を除去＝バグ3対策)
+    _jan_norm = normal['JAN'].apply(normalize_jan)
+    plan_del_out = pd.DataFrame()
+    plan_del_out['店舗CD'] = normal['店舗CD'].apply(normalize_jan)
+    plan_del_out['店舗名'] = normal['店舗名_norm']
+    plan_del_out['原料JAN'] = _jan_norm
+    plan_del_out['原料名'] = normal['商品名']
+    plan_del_out['JAN'] = _jan_norm  # JAN列も保持（update_data の二重参照対応）
+    plan_del_out['納品予定日'] = normal['納品予定日_iso']
+    plan_del_out['納品予定数'] = normal['納品予定数_n'].astype(int)
+
+    # 実納品数は納品予定数と同じ原料ベース列構成（納品予定数→仕入計上数 に差し替え）
+    actual_del_out = plan_del_out.drop(columns=['納品予定数']).copy()
+    actual_del_out['仕入計上数'] = normal['仕入計上数_n'].astype(int).values
+    
+    # ============ 2. CK拠点の振出庫 → 製造数として統合 ============
+    # [Phase1 BranchX 2026-06-24] 粕屋CK振出庫の「製造数への統合」を無効化。
+    #   真因: 松本さんの製造数.csv が CK製造(正)を実装当初から保持(Q1)。convert で
+    #         振出庫(-)を二重統合すると calculate_flow/評価系で相殺・高止まり(バグA)。
+    #   方針: ここでは ck_production_df を常に None に固定し、製造数は製造数.csv(正)一本に統一。
+    #         日次差分の CK製造(正)は松本さん側で供給(Q3 / 業務依頼#1)。
+    #   ロールバック: 下の「旧ロジック」コメントを復活させ、この固定2行を削除する。
+    ck_furideko = df[(df['_is_ck']) & (df['伝票区分名'] == '振出庫')].copy()
+    if len(ck_furideko) > 0:
+        print(f"\n    [Phase1 BranchX] CK振出庫 {len(ck_furideko)}行を検出（製造数への統合は無効化済み）")
+    ck_production_df = None  # Branch X: 常に統合しない
+
+    # --- 旧ロジック（Branch X で無効化。ロールバック時に下を復活し、上の固定を削除）---
+    # ck_production_df = None
+    # if len(ck_furideko) > 0:
+    #     print(f"\n    CK振出庫レコード: {len(ck_furideko)}行（製造数として統合）")
+    #     if master is None:
+    #         log_warning("CK振出庫の判定にマスタ（レシピ・原料）が必要だが、見つからなかった")
+    #         print(f"    マスタなしのため、JAN突合せずそのまま製造数に統合します")
+    #         ck_production_df = build_ck_production_simple(ck_furideko)
+    #     else:
+    #         ck_production_df = build_ck_production_with_master(ck_furideko, master)
+
+    # ============ 3. [Phase3] 非CK拠点の振出庫(店間振替の出し側) → 負の実納品(対称化) ============
+    # 受け側(振入庫,+)は normal 経路で actual_del に計上済み。出し側(振出庫,-)は L463 で
+    # 除外され消えていた(バグB)＝出し元店舗の在庫が引かれず高止まり。
+    # → 非CKの振出庫を「原料JAN ∈ 原料マスタ」の原料振替に限り、仕入計上数(負のまま)で
+    #   actual_del_out に追加して対称化。受け側(+)と出し側(-)でゼロサム＝情物一致。
+    # スコープ: 運用9店舗への限定は update_data(process_diff_load の運用店フィルタ)に委ねる
+    #   ＝白鳥PC・非運用店の出し側はそこで自動 drop(管理対象外)。商品振替(原料マスタに無い
+    #   JAN)は対象外＝drop(出し側は製造で原料消費済)。粕屋CKは ~_is_ck で除外(Phase1で別処理)。
+    if master is not None and master.get('material_jans'):
+        non_ck_furideko = df[(~df['_is_ck']) & (df['伝票区分名'] == '振出庫')].copy()
+        if len(non_ck_furideko) > 0:
+            njan = non_ck_furideko['JAN'].apply(normalize_jan)
+            is_material = njan.isin(master['material_jans'])
+            transfer = non_ck_furideko[is_material].copy()
+            n_product = int((~is_material).sum())
+            if len(transfer) > 0:
+                t_jan = transfer['JAN'].apply(normalize_jan)
+                furideko_adel = pd.DataFrame()
+                furideko_adel['店舗CD'] = transfer['店舗CD'].apply(normalize_jan)
+                furideko_adel['店舗名'] = transfer['店舗名_norm']
+                furideko_adel['原料JAN'] = t_jan
+                furideko_adel['原料名'] = transfer['商品名']
+                furideko_adel['JAN'] = t_jan
+                furideko_adel['納品予定日'] = transfer['納品予定日_iso']
+                # 振出庫は負。受け側(振入庫)と同じ「仕入計上数」列に、負のまま計上(対称化)。
+                furideko_adel['仕入計上数'] = transfer['仕入計上数_n'].astype(int).values
+                actual_del_out = pd.concat([actual_del_out, furideko_adel], ignore_index=True)
+                print(f"    [Phase3] 非CK振替(原料)を負 actual_del に対称化: {len(transfer)}行 "
+                      f"(商品/未登録振替 {n_product}行は対象外=drop)")
+
+    # 出力ファイル名の日付（最頻値）
+    most_common_date = df['納品予定日_iso'].mode()
+    date_str = most_common_date.iloc[0] if len(most_common_date) > 0 else None
+    yyyymmdd = get_yyyymmdd_from_iso(date_str)
+    if not yyyymmdd:
+        yyyymmdd = datetime.date.today().strftime('%Y%m%d')
+    
+    return plan_del_out, actual_del_out, ck_production_df, yyyymmdd
+
+
+def build_ck_production_simple(ck_furideko):
+    """マスタなしでCK振出庫を製造数フォーマットに変換（JAN突合なし）"""
+    out = pd.DataFrame()
+    out['日付'] = ck_furideko['納品予定日_iso']
+    out['店CD'] = ck_furideko['店舗CD'].astype(str).str.strip() if '店舗CD' in ck_furideko.columns else ''
+    out['店舗名'] = ck_furideko['店舗名_norm']
+    out['JAN'] = ck_furideko['JAN']
+    out['商品名'] = ck_furideko['商品名']
+    out['製造数'] = ck_furideko['納品予定数_n'].astype(int)  # マイナスのまま
+    return out
+
+
+def build_ck_production_with_master(ck_furideko, master):
+    """マスタありでCK振出庫を製造数フォーマットに変換（JAN突合あり）"""
+    rows = []
+    n_exact = 0
+    n_replaced = 0
+    n_skipped = 0
+    n_fake = 0
+    
+    fake_counter = [0]
+    fake_assigned = {}  # 同じ商品名なら同じ仮JANに
+    
+    for _, r in ck_furideko.iterrows():
+        jan = str(r['JAN']).strip()
+        name = str(r['商品名']).strip()
+        
+        result_kind, new_jan = classify_ck_record(jan, name, master)
+        
+        if result_kind == 'exact':
+            final_jan = jan
+            n_exact += 1
+        elif result_kind == 'replaced':
+            log_warning(
+                f"CK振出庫：商品名でJAN置換 {r['店舗名_norm']} '{name}' "
+                f"JAN {jan} → {new_jan}"
+            )
+            final_jan = new_jan
+            n_replaced += 1
+        elif result_kind == 'skipped':
+            log_warning(
+                f"CK振出庫：複数レシピにマッチ、取込スキップ "
+                f"{r['店舗名_norm']} '{name}' JAN {jan}"
+            )
+            n_skipped += 1
+            continue  # スキップ
+        else:  # 'fake'
+            key = normalize_name(name)
+            if key in fake_assigned:
+                final_jan = fake_assigned[key]
+            else:
+                fake_counter[0] += 1
+                final_jan = f"9992{fake_counter[0]:09d}"
+                fake_assigned[key] = final_jan
+            log_warning(
+                f"CK振出庫：レシピに該当なし、仮JAN付与 "
+                f"{r['店舗名_norm']} '{name}' JAN {jan} → {final_jan}"
+            )
+            n_fake += 1
+        
+        rows.append({
+            '日付': r['納品予定日_iso'],
+            '店CD': str(r['店舗CD']).strip() if pd.notna(r.get('店舗CD')) else '',
+            '店舗名': r['店舗名_norm'],
+            'JAN': final_jan,
+            '商品名': name,
+            '製造数': int(r['納品予定数_n']),  # マイナスのまま
+        })
+    
+    print(f"      JAN完全一致: {n_exact}件")
+    print(f"      商品名突合で置換: {n_replaced}件")
+    print(f"      複数候補でスキップ: {n_skipped}件")
+    print(f"      仮JAN付与: {n_fake}件")
+    
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
+def convert_inventory(src_path):
+    """棚卸データ.csv（既にUTF-8、年無し日付あり）を変換"""
+    print(f"\n  読込: {src_path.name}")
+    df = read_csv_safely(src_path)
+    print(f"    {len(df)}行 / {len(df.columns)}列")
+    
+    df = strip_jan(df, 'JAN')
+    
+    # 日付の年補完
+    if '棚卸日' in df.columns:
+        df['棚卸日'] = df['棚卸日'].apply(parse_date_to_iso)
+    
+    # 店舗名の正規化（既に「店」付きの想定だが念のため）
+    if '店舗' in df.columns:
+        df['店舗'] = df['店舗'].astype(str).str.strip().apply(normalize_store_name)
+    
+    return df, '棚卸データ.csv'  # フルロード時は日付なし
+
+
+def convert_plan(src_path):
+    """計画数データ.csv（既にUTF-8、年無し日付あり）を変換"""
+    print(f"\n  読込: {src_path.name}")
+    df = read_csv_safely(src_path)
+    print(f"    {len(df)}行 / {len(df.columns)}列")
+    
+    df = strip_jan(df, 'JAN')
+    
+    if '日付' in df.columns:
+        df['日付'] = df['日付'].apply(parse_date_to_iso)
+    
+    if '店舗' in df.columns:
+        df['店舗'] = df['店舗'].astype(str).str.strip().apply(normalize_store_name)
+    
+    return df, '計画数データ.csv'
+
+
+def convert_recipe(src_path):
+    """レシピデータ.csv をそのまま（JAN末尾空白除去）"""
+    print(f"\n  読込: {src_path.name}")
+    df = read_csv_safely(src_path)
+    print(f"    {len(df)}行 / {len(df.columns)}列")
+    df = strip_jan(df, 'JAN')
+    df = strip_jan(df, '原料JAN')
+    return df, 'レシピデータ.csv'
+
+
+def convert_material(src_path):
+    """原料データ.csv をそのまま（JAN末尾空白除去）"""
+    print(f"\n  読込: {src_path.name}")
+    df = read_csv_safely(src_path)
+    print(f"    {len(df)}行 / {len(df.columns)}列")
+    df = strip_jan(df, '原料JAN')
+    return df, '原料データ.csv'
+
+
+# ========== メイン処理 ==========
+def main():
+    start_time = datetime.datetime.now()
+    print_section("業務システム生データ → アプリ取込形式 変換")
+    print(f"  実行時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  入力: {SRC_DIR}")
+    print(f"  出力: {DST_DIR}")
+    
+    if not SRC_DIR.exists():
+        print(f"\n[ERROR] フォルダが存在しません: {SRC_DIR}")
+        SRC_DIR.mkdir(exist_ok=True)
+        print(f"フォルダを作成しました。生ファイルを置いて再実行してください。")
+        return False
+    
+    DST_DIR.mkdir(exist_ok=True)
+
+    # === zip 自動解凍 (2026-05-14 追加：業務システムは zip で出力するため) ===
+    import zipfile as _zf
+    zip_files = [f for f in SRC_DIR.iterdir() if f.is_file() and f.suffix.lower() == '.zip']
+    if zip_files:
+        print_section("zip 自動解凍")
+        zip_archive_dir = SRC_DIR / '_processed_zip'
+        zip_archive_dir.mkdir(exist_ok=True)
+        for zf in zip_files:
+            try:
+                with _zf.ZipFile(zf) as z:
+                    for name in z.namelist():
+                        target = SRC_DIR / name
+                        with z.open(name) as src_f, open(target, 'wb') as dst_f:
+                            dst_f.write(src_f.read())
+                        print(f"  [解凍] {zf.name} → {name}")
+                # zip 自体は _processed_zip/ に退避
+                zf.rename(zip_archive_dir / zf.name)
+            except Exception as e:
+                log_warning(f"zip 解凍失敗: {zf.name} - {e}")
+
+    # ファイルを種別ごとに分類
+    src_files = [f for f in SRC_DIR.iterdir() if f.is_file() and not f.name.startswith('.')]
+    if not src_files:
+        print(f"\n[ERROR] {SRC_DIR} にファイルがありません。")
+        return False
+    
+    classified = {}
+    unknown = []
+    for f in src_files:
+        kind = detect_file_kind(f)
+        if kind:
+            classified.setdefault(kind, []).append(f)
+        else:
+            unknown.append(f)
+    
+    print(f"\n  対象ファイル: {len(src_files)} 件")
+    for kind, files in classified.items():
+        print(f"    {kind}: {len(files)}")
+    if unknown:
+        print(f"    不明（スキップ）: {len(unknown)}")
+        for f in unknown:
+            print(f"      - {f.name}")
+    
+    # マスタを先に読み込む（CK判定用）
+    master = load_master_for_lookup()
+    if master:
+        print(f"\n  マスタ読込済み: 商品JAN {len(master['product_jans'])}件 / "
+              f"商品名キー {len(master['name_to_jan_unique'])}件（一意）+ "
+              f"{len(master['name_to_jan_multi'])}件（複数候補）")
+    else:
+        print(f"\n  [WARN] レシピ・原料マスタが見つからない。CK振出庫の判定はスキップ。")
+    
+    output_files = []
+    ck_production_dfs = []  # 製造数CSVに統合する用
+    production_main_yyyymmdd = None
+    processed_srcs = []  # 変換に成功した生ファイル（最後に _processed_* へ退避して再処理を防ぐ）
+    
+    # ============ 1. レシピ・原料マスタ ============
+    if 'recipe' in classified:
+        print_section("レシピデータの変換")
+        for f in classified['recipe']:
+            try:
+                df, name = convert_recipe(f)
+                out_path = DST_DIR / name
+                df.to_csv(out_path, index=False, encoding='utf-8-sig')
+                output_files.append(out_path)
+                processed_srcs.append(f)
+                print(f"  [OK] 出力: {name}（{len(df)}行）")
+            except Exception as e:
+                log_warning(f"レシピ変換エラー {f.name}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    if 'material' in classified:
+        print_section("原料データの変換")
+        for f in classified['material']:
+            try:
+                df, name = convert_material(f)
+                out_path = DST_DIR / name
+                df.to_csv(out_path, index=False, encoding='utf-8-sig')
+                output_files.append(out_path)
+                processed_srcs.append(f)
+                print(f"  [OK] 出力: {name}（{len(df)}行）")
+            except Exception as e:
+                log_warning(f"原料変換エラー {f.name}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # ============ 2. 棚卸データ ============
+    if 'inventory' in classified:
+        print_section("棚卸データの変換")
+        for f in classified['inventory']:
+            try:
+                df, name = convert_inventory(f)
+                out_path = DST_DIR / name
+                df.to_csv(out_path, index=False, encoding='utf-8-sig')
+                output_files.append(out_path)
+                processed_srcs.append(f)
+                print(f"  [OK] 出力: {name}（{len(df)}行）")
+            except Exception as e:
+                log_warning(f"棚卸変換エラー {f.name}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # ============ 3. 計画数データ ============
+    if 'plan' in classified:
+        print_section("計画数データの変換")
+        for f in classified['plan']:
+            try:
+                df, name = convert_plan(f)
+                out_path = DST_DIR / name
+                df.to_csv(out_path, index=False, encoding='utf-8-sig')
+                output_files.append(out_path)
+                processed_srcs.append(f)
+                print(f"  [OK] 出力: {name}（{len(df)}行）")
+            except Exception as e:
+                log_warning(f"計画数変換エラー {f.name}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # ============ 4. 製造数CSV（CP932生） ============
+    production_main_df = None
+    production_main_name = None
+    if 'production' in classified:
+        print_section("製造数CSVの変換（業務システム生データ）")
+        for f in classified['production']:
+            try:
+                df, name = convert_production(f)
+                # 後でCKを統合してから書き出し
+                production_main_df = df
+                production_main_name = name
+                production_main_yyyymmdd = re.match(r'^(\d{8})', name).group(1) if re.match(r'^(\d{8})', name) else None
+                processed_srcs.append(f)
+                print(f"  [読込完了] {name}（{len(df)}行）")
+            except Exception as e:
+                log_warning(f"製造数変換エラー {f.name}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # ============ 5. 納品予定確認 ============
+    if 'delivery' in classified:
+        print_section("納品予定確認の変換")
+        for f in classified['delivery']:
+            try:
+                plan_del, actual_del, ck_prod, yyyymmdd = convert_delivery(f, master)
+                
+                if plan_del is None:
+                    continue
+                
+                # 通常店舗の納品予定数
+                if len(plan_del) > 0:
+                    name = f"{yyyymmdd}納品予定数.csv"
+                    out_path = DST_DIR / name
+                    plan_del.to_csv(out_path, index=False, encoding='utf-8-sig')
+                    output_files.append(out_path)
+                    print(f"  [OK] 出力: {name}（{len(plan_del)}行）")
+                
+                # 通常店舗の実納品数
+                if len(actual_del) > 0:
+                    name = f"{yyyymmdd}実納品数.csv"
+                    out_path = DST_DIR / name
+                    actual_del.to_csv(out_path, index=False, encoding='utf-8-sig')
+                    output_files.append(out_path)
+                    print(f"  [OK] 出力: {name}（{len(actual_del)}行）")
+                
+                # CKの振出庫を製造数に統合する用
+                if ck_prod is not None and len(ck_prod) > 0:
+                    ck_production_dfs.append(ck_prod)
+                    if production_main_yyyymmdd is None:
+                        production_main_yyyymmdd = yyyymmdd
+
+                processed_srcs.append(f)
+            except Exception as e:
+                log_warning(f"納品予定確認 変換エラー {f.name}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    # ============ 6. 製造数CSVを書き出し（CK振出庫統合） ============
+    if production_main_df is not None or ck_production_dfs:
+        print_section("製造数CSV最終出力（CK振出庫統合）")
+        
+        all_production = []
+        if production_main_df is not None:
+            all_production.append(production_main_df)
+        all_production.extend(ck_production_dfs)
+        
+        if all_production:
+            combined = pd.concat(all_production, ignore_index=True)
+            
+            # ファイル名決定
+            if production_main_name:
+                final_name = production_main_name
+            elif production_main_yyyymmdd:
+                final_name = f"{production_main_yyyymmdd}製造数.csv"
+            else:
+                final_name = f"{datetime.date.today().strftime('%Y%m%d')}製造数.csv"
+            
+            out_path = DST_DIR / final_name
+            combined.to_csv(out_path, index=False, encoding='utf-8-sig')
+            output_files.append(out_path)
+            print(f"  [OK] 出力: {final_name}（{len(combined)}行）")
+            print(f"       内訳：通常店舗 {sum(len(d) for d in [production_main_df] if d is not None)}行 / "
+                  f"CK振出庫 {sum(len(d) for d in ck_production_dfs)}行")
+    
+    # ============ 7. 変換済み生ファイルの退避（再処理防止） ============
+    # ここまで到達した = 全変換が成功。消費した生ファイルを _processed_<日時>/ に
+    # 移動し、次回 convert 実行時に同じファイルを再処理しないようにする。
+    # 移動先から business_system_export 直下へ戻せば再処理できる（可逆）。
+    #
+    # ただし「直近の配置日」のファイルは目印として残す（武田さん方針 2026-05-25）。
+    #   - 配置日 = 各ファイルの更新時刻(mtime)の日付（＝置いたタイミング）
+    #   - 最新の配置日のファイルは残置 → 「どこまで置いたか」が一目で分かる
+    #   - それより古い処理済みファイルだけ退避 → 滞留・全再処理を防ぐ
+    #   - 残置した最新分は次回再処理されるが、出力は同じ（update_data 側で冪等にマージ）
+    # 未知ファイル（unknown）・未対応ファイルはそもそも処理しないので残置される。
+    # (2026-05-25 追加：生ファイル滞留で毎回全再処理されていた問題を解消)
+    if processed_srcs:
+        print_section("変換済み生ファイルの退避（再処理防止）")
+
+        def _placed_date(p):
+            """ファイルの配置日（更新時刻の日付）。取得失敗時は最古扱い。"""
+            try:
+                return datetime.date.fromtimestamp(p.stat().st_mtime)
+            except OSError:
+                return datetime.date.min
+
+        latest_day = max(_placed_date(f) for f in processed_srcs)
+        to_archive = [f for f in processed_srcs if _placed_date(f) < latest_day]
+        kept = [f for f in processed_srcs if _placed_date(f) >= latest_day]
+
+        if to_archive:
+            stamp = start_time.strftime('%Y%m%d_%H%M%S')
+            archive_dir = SRC_DIR / f'_processed_{stamp}'
+            archive_dir.mkdir(exist_ok=True)
+            moved = 0
+            for f in to_archive:
+                try:
+                    f.rename(archive_dir / f.name)
+                    print(f"  [退避] {f.name}")
+                    moved += 1
+                except Exception as e:
+                    log_warning(f"生ファイル退避失敗（変換は成功済み）: {f.name} - {e}")
+            print(f"\n  → business_system_export/_processed_{stamp}/ に {moved}件 退避")
+            print(f"     戻す場合：このフォルダ内のファイルを business_system_export 直下へ移動")
+        else:
+            print(f"  退避対象なし（処理済みは全て直近配置日 {latest_day} のため残置）")
+
+        if kept:
+            print(f"\n  [残置] 直近配置日 {latest_day} のファイルは目印として残します（{len(kept)}件）:")
+            for f in kept:
+                print(f"    - {f.name}")
+
+    # ============ サマリー ============
+    save_warnings_log()
+    
+    elapsed = (datetime.datetime.now() - start_time).total_seconds()
+    print_section("完了")
+    print(f"  処理時間: {elapsed:.1f}秒")
+    print(f"  出力ファイル: {len(output_files)}件")
+    for p in output_files:
+        print(f"    - {p.name}")
+    
+    if WARNINGS:
+        print(f"\n  ⚠️ 警告: {len(WARNINGS)}件（詳細は {WARNING_LOG_PATH.name}）")
+    
+    print(f"\n  次の手順:")
+    print(f"    1. update_data.bat をダブルクリック")
+    print(f"    2. アプリを再起動")
+    
+    return True
+
+
+if __name__ == '__main__':
+    try:
+        ok = main()
+        if ok:
+            print("\n[OK] 処理完了\n")
+        else:
+            print("\n[NG] 処理失敗\n")
+    except Exception as e:
+        import traceback
+        print(f"\n[ERROR] {e}\n")
+        traceback.print_exc()
+    finally:
+        input("\nEnter キーで終了...")
